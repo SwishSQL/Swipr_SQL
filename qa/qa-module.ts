@@ -4038,8 +4038,7 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
     // ===== Phase 3: CC Supervisor notes =====
     // Notes live on the related row itself (coaching_requests /
     // escalation_logs) — single text field per row, no separate table.
-    try { await db.exec("ALTER TABLE coaching_requests ADD COLUMN IF NOT EXISTS cc_supervisor_note TEXT"); } catch(e) {}
-    try { await db.exec("ALTER TABLE escalation_logs ADD COLUMN IF NOT EXISTS cc_supervisor_note TEXT"); } catch(e) {}
+    // (cc_supervisor_note columns come from sql/schema.sql — the application issues no DDL)
 
     app.post("/cc/notes/coaching/:id", async (req, res) => {
       try {
@@ -4123,17 +4122,7 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
     //   Coachings  60%  — count vs target
     //   Escalations SLA 40%  — % responded within SLA hours
     // =================================================================
-    await db.exec(`
-      CREATE TABLE IF NOT EXISTS tl_kpi_config (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER UNIQUE,
-        coaching_target INTEGER DEFAULT 20,
-        escalation_sla_hours INTEGER DEFAULT 24,
-        weight_coaching REAL DEFAULT 0.6,
-        weight_sla REAL DEFAULT 0.4,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
+    // (tl_kpi_config comes from sql/schema.sql)
     try {
       const existing = await db.prepare("SELECT id FROM tl_kpi_config WHERE user_id IS NULL").get();
       if (!existing) {

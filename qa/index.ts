@@ -14,14 +14,14 @@ import { createQaDb } from './db';
 import { buildQaRoutes } from './qa-module';
 
 export interface QaModuleOptions {
-  connectionString: string;
-  ssl?: any;
+  /** Swipr's data layer (db.js `pool`): the module runs on the same SQL Server connection pool. */
+  pool: any;
   /** Swipr's `authenticate` middleware (sets req.user from the Bearer token). */
   authenticate: express.RequestHandler;
 }
 
 export async function createQaModule(opts: QaModuleOptions): Promise<express.Router> {
-  const db = createQaDb({ connectionString: opts.connectionString, ssl: opts.ssl });
+  const db = createQaDb({ pool: opts.pool });
   const router = express.Router();
 
   // QA evaluations carry attached images (base64 when Cloudinary is off): same 20mb allowance the QA server had.
@@ -111,7 +111,7 @@ export async function createQaModule(opts: QaModuleOptions): Promise<express.Rou
                 p.qa_role, p.qa_status, p.qa_department, p.tl_user_id, p.cc_supervisor_user_id, p.allowed_departments, p.allowed_brands
          FROM users u LEFT JOIN qa_user_profile p ON p.user_id = u.id
          WHERE COALESCE(u.data->>'status','active') <> 'deleted'
-         ORDER BY (p.user_id IS NULL), u.data->>'name'`,
+         ORDER BY CASE WHEN p.user_id IS NULL THEN 1 ELSE 0 END, u.data->>'name'`,
       );
       res.json(r.rows.map((x: any) => ({ ...x, allowed_departments: parse(x.allowed_departments), allowed_brands: parse(x.allowed_brands) })));
     } catch (e: any) { res.status(500).json({ error: e.message }); }

@@ -226,14 +226,119 @@ export function convertOnConflict(sql) {
     `WHEN NOT MATCHED THEN INSERT (${cols.map((c) => `[${c}]`).join(', ')}) VALUES (${cols.map((c) => `src.[${c}]`).join(', ')})${outputClause};`;
 }
 
-/** UPDATE t alias SET ... FROM ...  is fine in T-SQL only as UPDATE alias SET ... FROM t alias — handled where used */
+// ---- rules needed by the Quality module's SQL ---------------------------------------------------------------------
+/** operand to the left of index `end` (a balanced (...) with an optional function name, or a dotted identifier) */
+function leftOperand(s, end) {
+  let start;
+  if (s[end - 1] === ')') {
+    let depth = 0, i = end - 1;
+    for (; i >= 0; i--) { if (s[i] === ')') depth++; else if (s[i] === '(' && --depth === 0) break; }
+    start = i;
+    const fn = /([A-Za-z_][\w.]*)\s*$/.exec(s.slice(0, start));
+    if (fn && !SQL_WORDS.has(fn[1].toUpperCase())) start -= fn[0].length;
+  } else {
+    const tok = /([A-Za-z_@\[][\w.@\[\]]*)\s*$/.exec(s.slice(0, end));
+    if (!tok) return null;
+    start = end - tok[0].length;
+  }
+  return start;
+}
+
+/** clock functions: PostgreSQL's session runs in UTC, so T-SQL's UTC clock is the equivalent */
+export function convertClock(sql) {
+  return outsideLiterals(sql, (p) => p
+    .replace(/\bNOW\s*\(\s*\)/gi, 'SYSUTCDATETIME()')
+    .replace(/\bCURRENT_TIMESTAMP\b/gi, 'SYSUTCDATETIME()')
+    .replace(/\bCURRENT_DATE\b/gi, 'CAST(SYSUTCDATETIME() AS DATE)'));
+}
+
+/** X - INTERVAL '48 hours'  ->  DATEADD(HOUR, -48, X)      EXTRACT(EPOCH FROM (a - b))  ->  DATEDIFF(SECOND, b, a) */
+export function convertIntervals(sql) {
+  let out = sql.replace(/(SYSUTCDATETIME\(\)|[A-Za-z_][\w.]*)\s*([-+])\s*INTERVAL\s*'(\d+)\s*(second|minute|hour|day|week|month|year)s?'/gi,
+    (_, x, op, n, unit) => `DATEADD(${unit.toUpperCase()}, ${op === '-' ? '-' : ''}${n}, ${x})`);
+  for (let guard = 0; guard < 20; guard++) {
+    const m = /EXTRACT\s*\(\s*EPOCH\s+FROM\s*/i.exec(out);
+    if (!m) break;
+    const open = out.indexOf('(', m.index), close = matchParen(out, open);
+    const inner = out.slice(open + 1, close).replace(/^\s*EPOCH\s+FROM\s*/i, '').trim().replace(/^\((.*)\)$/s, '$1');
+    const parts = splitMinus(inner);
+    out = out.slice(0, m.index) + (parts ? `DATEDIFF(SECOND, ${parts[1]}, ${parts[0]})` : `DATEDIFF(SECOND, '1970-01-01', ${inner})`) + out.slice(close + 1);
+  }
+  return out;
+}
+function splitMinus(s) {
+  let depth = 0;
+  for (let i = 0; i < s.length; i++) { if (s[i] === '(') depth++; else if (s[i] === ')') depth--; else if (s[i] === '-' && depth === 0 && /\s/.test(s[i - 1] || '') && /\s/.test(s[i + 1] || '')) return [s.slice(0, i).trim(), s.slice(i + 1).trim()]; }
+  return null;
+}
+
+/** a ILIKE b  ->  LOWER(a) LIKE LOWER(b)   (columns are case-sensitive: BIN2) */
+export function convertIlike(sql) {
+  let out = sql;
+  for (let guard = 0; guard < 50; guard++) {
+    const m = /\s+ILIKE\s+/i.exec(out);
+    if (!m) break;
+    const start = leftOperand(out, m.index);
+    const right = /^(@p\d+|'(?:[^']|'')*')/.exec(out.slice(m.index + m[0].length));
+    if (start === null || !right) break;
+    out = `${out.slice(0, start)}LOWER(${out.slice(start, m.index)}) LIKE LOWER(${right[1]})${out.slice(m.index + m[0].length + right[1].length)}`;
+  }
+  return out;
+}
+
+/** regexp_replace(X, '[^0-9]', '', 'g')  ->  dbo.fn_digits(X)   (the only regexp the app uses: keep the digits) */
+export function convertDigitsRegex(sql) {
+  let out = sql;
+  for (let guard = 0; guard < 20; guard++) {
+    const m = /\bregexp_replace\s*\(/i.exec(out);
+    if (!m) break;
+    const open = out.indexOf('(', m.index), close = matchParen(out, open);
+    const args = splitTopLevel(out.slice(open + 1, close));
+    if (!(args[1] || '').includes('[^0-9]')) break;
+    out = `${out.slice(0, m.index)}dbo.fn_digits(${args[0]})${out.slice(close + 1)}`;
+  }
+  return out;
+}
+
+/** AVG(int) is an integer in T-SQL and a decimal in PostgreSQL */
+export function convertAvg(sql) {
+  let out = '', rest = sql;
+  for (let guard = 0; guard < 200; guard++) {
+    const m = /\bAVG\s*\(/i.exec(rest);
+    if (!m) break;
+    const open = rest.indexOf('(', m.index), close = matchParen(rest, open);
+    const inner = rest.slice(open + 1, close).trim();
+    out += rest.slice(0, m.index) + (/^CAST\(/i.test(inner) && /AS\s+FLOAT\s*\)$/i.test(inner) ? `AVG(${inner})` : `AVG(CAST(${inner} AS FLOAT))`);
+    rest = rest.slice(close + 1);
+  }
+  return out + rest;
+}
+
+export function convertMisc(sql) {
+  return outsideLiterals(sql, (p) => p
+    .replace(/\bsubstr\s*\(/gi, 'SUBSTRING(')
+    .replace(/\bAS\s+TEXT\b/gi, 'AS NVARCHAR(MAX)')
+    .replace(/\s\|\|\s/g, ' + ')
+    .replace(/\bROUND\s*\(\s*([^(),]+)\s*\)/gi, 'ROUND($1, 0)'));
+}
+
+/** column names that are reserved words in T-SQL: bracket them (PLAN, KEY) */
+export function convertReserved(sql) {
+  return outsideLiterals(sql, (p) => p.replace(/(?<![\[\w@$])(plan|key)(?![\w\]])/gi, '[$1]'));
+}
 
 export function translateSql(raw) {
   let s = stripComments(raw).trim().replace(/;\s*$/, '');
   if (/^\s*(BEGIN|COMMIT|ROLLBACK)\s*;?\s*$/i.test(s)) return s;
   s = convertPlaceholders(s);
+  s = convertClock(s);
+  s = convertIntervals(s);
+  s = convertDigitsRegex(s);
   s = convertJsonArrow(s);
   s = convertCasts(s);
+  s = convertIlike(s);
+  s = convertMisc(s);
+  s = convertAvg(s);
   s = convertAny(s);
   s = convertUnnest(s);
   s = convertDistinctFrom(s);
@@ -244,5 +349,6 @@ export function translateSql(raw) {
   s = convertNulls(s);
   s = convertDeleteAlias(s);
   s = convertLimit(s);
+  s = convertReserved(s);
   return s;
 }

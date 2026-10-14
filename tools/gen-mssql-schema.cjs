@@ -81,6 +81,7 @@ for (const [t, d] of Object.entries(cat)) {
     sql += `IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'${i.indexname}' AND object_id = OBJECT_ID(N'dbo.${t}'))\nCREATE ${unique}INDEX ${q(i.indexname)} ON dbo.${q(t)} (${cols})${w};\nGO\n`;
   }
 }
+sql += fs.readFileSync(__dirname + '/mssql-functions.sql', 'utf8');
 sql += fs.readFileSync(__dirname + '/mssql-views.sql', 'utf8');
 fs.mkdirSync(require('path').dirname(OUT), { recursive: true });
 fs.writeFileSync(OUT, sql);

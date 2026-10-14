@@ -5,9 +5,11 @@
 import fs from 'node:fs';
 import { getPool, sql, pool } from '../db.js';
 import { translateSql } from '../db-translate.js';
+import { qaPre } from '../qa/qa-sql.js';
 
 const file = process.argv[2] || 'server.js';
 const show = process.argv.includes('--show');
+const QA = process.argv.includes('--qa');            // Quality module: SQLite-style statements, pre-translated by qa-sql.js
 const src = fs.readFileSync(file, 'utf8');
 const found = [];
 const re = /(?:\.query|\.prepare|\.all|\.get|\.run)\(\s*(`|'|")/g;
@@ -23,7 +25,7 @@ for (const f of found) {
   // ${...} interpolations inside template literals are code, not SQL: stand in a harmless placeholder
   const raw = f.raw.replace(/\$\{[^}]*\}/g, '1');
   let t;
-  try { t = translateSql(raw); } catch (e) { bad.push({ ...f, why: 'translator threw: ' + e.message }); continue; }
+  try { t = translateSql(QA ? qaPre(raw) : raw); } catch (e) { bad.push({ ...f, why: 'translator threw: ' + e.message }); continue; }
   const leftovers = [...(t.match(/\$\d|::|->>|=\s*ANY\s*\(|\bUNNEST\b|\bON\s+CONFLICT\b|\bRETURNING\b|\bLIMIT\b|\bILIKE\b/gi) || [])];
   const n = (t.match(/@p(\d+)/g) || []).map((x) => Number(x.slice(2)));
   const decl = [...new Set(n)].map((i) => `DECLARE @p${i} NVARCHAR(MAX);`).join(' ');

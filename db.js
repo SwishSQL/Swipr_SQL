@@ -80,8 +80,9 @@ function parseJsonColumns(rows) {
 
 // ---- running a statement ----------------------------------------------------------------------------------------
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !(v instanceof Date) && !Buffer.isBuffer(v);
-function bind(request, params = []) {
+function bind(request, params = [], used = null) {
   params.forEach((val, i) => {
+    if (used && !used.has(i)) return;                    // collapsed IN-list members are not sent
     if (val === undefined) val = null;
     if (Array.isArray(val) || isPlainObject(val)) val = JSON.stringify(val);        // jsonb / array parameters
     if (typeof val === 'number' && !Number.isInteger(val)) request.input(`p${i}`, sql.Float, val);
@@ -91,13 +92,40 @@ function bind(request, params = []) {
   });
 }
 
-async function run(executor, text, params) {
+/** BIGINT columns -> JS numbers (the Quality module compares them with numbers; Swipr's own code expects strings) */
+function bigintsToNumbers(res, rows) {
+  const cols = res.recordset && res.recordset.columns;
+  if (!cols) return rows;
+  const big = Object.keys(cols).filter((k) => cols[k].type === sql.BigInt || cols[k].type?.declaration === 'bigint');
+  if (!big.length) return rows;
+  for (const row of rows) for (const k of big) if (typeof row[k] === 'string') row[k] = Number(row[k]);
+  return rows;
+}
+
+/**
+ * SQL Server accepts at most 2100 parameters per statement (PostgreSQL ~65000). Long `IN ($1, $2, ... $n)` lists — the Quality
+ * dashboards build them from every evaluation in scope — are sent as ONE JSON array parameter and unnested with OPENJSON.
+ */
+export function collapseInLists(text, params) {
+  if (!params || params.length < 200) return { text, params };
+  const extra = [];
+  const out = text.replace(/\bIN\s*\(\s*(\$\d+(?:\s*,\s*\$\d+){49,})\s*\)/gi, (_, list) => {
+    const idx = list.match(/\$(\d+)/g).map((x) => Number(x.slice(1)) - 1);
+    extra.push(idx.map((i) => params[i]));
+    return `IN (SELECT [value] COLLATE Latin1_General_100_BIN2 FROM OPENJSON($${params.length + extra.length}))`;
+  });
+  return extra.length ? { text: out, params: [...params, ...extra] } : { text, params };
+}
+
+async function run(executor, text0, params0, opts = {}) {
+  const { text, params } = collapseInLists(text0, params0);
   const t = translateSql(text);
   const request = executor.request();
-  bind(request, params);
+  bind(request, params, new Set([...t.matchAll(/@p(\d+)/g)].map((m) => Number(m[1]))));
   try {
     const res = await request.query(t);
-    const rows = parseJsonColumns(res.recordset ? [...res.recordset] : []);
+    let rows = parseJsonColumns(res.recordset ? [...res.recordset] : []);
+    if (opts.bigintNumbers) rows = bigintsToNumbers(res, rows);
     const affected = (res.rowsAffected || []).reduce((a, b) => a + b, 0);
     return { rows, rowCount: res.recordset ? rows.length : affected, command: undefined };
   } catch (e) {
@@ -109,12 +137,12 @@ async function run(executor, text, params) {
 
 class Client {
   constructor(pool) { this.pool = pool; this.tx = null; }
-  async query(text, params = []) {
+  async query(text, params = [], opts) {
     const kw = typeof text === 'string' ? text.trim().replace(/;$/, '').toUpperCase() : '';
     if (kw === 'BEGIN') { this.tx = new sql.Transaction(this.pool); await this.tx.begin(); return { rows: [], rowCount: 0 }; }
     if (kw === 'COMMIT') { if (this.tx) await this.tx.commit(); this.tx = null; return { rows: [], rowCount: 0 }; }
     if (kw === 'ROLLBACK') { if (this.tx) { try { await this.tx.rollback(); } catch { /* connection already gone */ } } this.tx = null; return { rows: [], rowCount: 0 }; }
-    return run(this.tx || this.pool, text, params);
+    return run(this.tx || this.pool, text, params, opts);
   }
   release() { if (this.tx) { this.tx.rollback().catch(() => {}); this.tx = null; } }
 }
@@ -131,7 +159,7 @@ export function getPool() {
 
 /** a `pg`-shaped pool */
 export const pool = {
-  async query(text, params = []) { return run(await getPool(), text, params); },
+  async query(text, params = [], opts) { return run(await getPool(), text, params, opts); },
   async connect() { return new Client(await getPool()); },
   async end() { if (poolPromise) { const p = await poolPromise.catch(() => null); poolPromise = null; if (p) await p.close(); } },
   on() { return pool; },

@@ -740,6 +740,20 @@ GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'xontel_sessions_start_idx' AND object_id = OBJECT_ID(N'dbo.xontel_sessions'))
 CREATE INDEX [xontel_sessions_start_idx] ON dbo.[xontel_sessions] ([start_ts]);
 GO
+-- fn_digits(x): x with everything but the digits 0-9 removed. The Quality module matches customer phone numbers by their last
+-- eight digits (PostgreSQL: regexp_replace(x, '[^0-9]', '', 'g')); the app's SQL translator maps that call to this function.
+CREATE OR ALTER FUNCTION dbo.[fn_digits](@s NVARCHAR(MAX)) RETURNS NVARCHAR(MAX) AS
+BEGIN
+  IF @s IS NULL RETURN NULL;
+  DECLARE @i INT = PATINDEX('%[^0-9]%' COLLATE Latin1_General_100_BIN2, @s);
+  WHILE @i > 0
+  BEGIN
+    SET @s = STUFF(@s, @i, 1, N'');
+    SET @i = PATINDEX('%[^0-9]%' COLLATE Latin1_General_100_BIN2, @s);
+  END
+  RETURN @s;
+END;
+GO
 -- Quality's view of its people: Swipr users that have a Quality profile, plus former staff (no Swipr account, kept for history).
 CREATE OR ALTER VIEW dbo.[qa_users] AS
 SELECT u.[id] AS [id],

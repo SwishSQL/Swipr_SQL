@@ -2170,7 +2170,7 @@ app.use(compression());
 if (process.env.QA_MODULE !== 'off') {
   try {
     const { createQaModule } = await import('./qa-dist/qa.mjs');
-    app.use('/api/qa', await createQaModule({ connectionString: process.env.DATABASE_URL, ssl: sslConfig(), authenticate }));
+    app.use('/api/qa', await createQaModule({ pool, authenticate }));
     console.log('[qa] Quality module mounted at /api/qa');
   } catch (e) {
     console.error('[qa] Quality module NOT loaded:', e?.message || e);
