@@ -104,6 +104,9 @@ async function http<T = any>(method: string, path: string, body?: any): Promise<
 
   // Session expired or missing — drop credentials and return to login.
   if (res.status === 401) {
+    // An admin deactivated the account: say so on the login page.
+    const why = await res.clone().json().catch(() => null);
+    if (why?.disabled) { try { sessionStorage.setItem('swipr_logout_reason', 'disabled'); } catch { /* ignore */ } }
     setToken(null);
     try { localStorage.removeItem('swipr_auth'); } catch { /* ignore */ }
     if (!location.hash.startsWith('#/login')) {
@@ -215,7 +218,8 @@ export class Store {
   }
 
   async login(username: string, password: string): Promise<User | null> {
-    const res = await http<{ user: User | null; token?: string }>('POST', '/login', { username, password });
+    const res = await http<{ user: User | null; token?: string; disabled?: boolean }>('POST', '/login', { username, password });
+    if (res?.disabled) throw new Error('ACCOUNT_DISABLED');
     if (res?.user && res.token) setToken(res.token);
     return res?.user || null;
   }

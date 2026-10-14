@@ -18,6 +18,16 @@ export default function LoginPage() {
   const { t } = useLanguage();
   const navigate = useNavigate();
 
+  // Sent here because an admin deactivated the account mid-session.
+  useEffect(() => {
+    try {
+      if (sessionStorage.getItem('swipr_logout_reason') === 'disabled') {
+        sessionStorage.removeItem('swipr_logout_reason');
+        setError(t('login.disabled'));
+      }
+    } catch { /* ignore */ }
+  }, []);
+
   useEffect(() => {
     const checkSetup = async () => {
       try {
@@ -43,7 +53,7 @@ export default function LoginPage() {
         setError(t('login.invalidCreds'));
       }
     } catch (err) {
-      setError(t('login.connectionError'));
+      setError(t((err as Error)?.message === 'ACCOUNT_DISABLED' ? 'login.disabled' : 'login.connectionError'));
     } finally {
       setIsLoading(false);
     }

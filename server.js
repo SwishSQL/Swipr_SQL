@@ -1164,13 +1164,14 @@ async function xontelOpenBreak(userId, cur, now) {
   const dept = !isBranchRole(me.role) ? nrm(me.companyName) : null;
   if (dept) {
     const { rows: peer } = await pool.query(
-      `SELECT u.data->>'name' AS name FROM breaks b JOIN users u ON u.id = b.user_id
+      `SELECT u.data->>'name' AS name, u.data->>'adminOnly' AS hidden FROM breaks b JOIN users u ON u.id = b.user_id
         WHERE b.ended_at IS NULL AND b.user_id <> $1 AND b.started_at <= $3
           AND u.data->>'role' = 'EMPLOYEE' AND lower(trim(u.data->>'companyName')) = $2
         ORDER BY b.started_at LIMIT 1`,
       [userId, dept, since]
     );
-    if (peer[0]) problems.push(`while ${peer[0].name} was already on a break`);
+    // The leads being told must not learn an adminOnly colleague's name.
+    if (peer[0]) problems.push(`while ${peer[0].hidden === 'true' && !me.adminOnly ? 'a colleague' : peer[0].name} was already on a break`);
   }
   if (!problems.length) return;
   const watchers = await breakWatchersFor(me);
@@ -1766,7 +1767,7 @@ function teardownCall(callId, reason, endedByUserId, logAs) {
 async function handleCallOffer(caller, calleeId, sdp) {
   if (calleeId === caller.id) return { error: 'You cannot call yourself.' };
   const callee = await getUserRow(calleeId);
-  if (!callee) return { error: 'That employee could not be found.' };
+  if (!callee || isHiddenFrom(caller, callee)) return { error: 'That employee could not be found.' };
 
   const callId = genId();
   const declineToken = genId();
@@ -1989,9 +1990,26 @@ async function getUserRow(id) {
   return rows[0] ? { id: rows[0].id, ...rows[0].data } : null;
 }
 
+// An account flagged adminOnly (set by an admin in User Management) is
+// invisible to everyone but admins and the person themself: rosters,
+// directories, breaks, KPIs, requests, calls, and the notifications about
+// them. canSeeUser/canWriteSchedule enforce it for every scoped route; the
+// routes that bypass them check it here.
+const isHiddenFrom = (viewer, t) => !!t?.adminOnly && viewer?.role !== 'ADMIN' && viewer?.id !== t?.id;
+async function adminOnlyUserIds() {
+  const { rows } = await pool.query(`SELECT id FROM users WHERE data->>'adminOnly' = 'true'`);
+  return new Set(rows.map((r) => r.id));
+}
+async function adminUsers() {
+  const { rows } = await pool.query(`SELECT id, data FROM users WHERE data->>'role' = 'ADMIN'`);
+  return rows.map((r) => ({ id: r.id, ...r.data }));
+}
+
 // Branch Managers responsible for a branch employee — the people notified
-// when that employee starts or ends a break.
+// when that employee starts or ends a break. An adminOnly account's news
+// goes to the admins instead.
 async function branchManagersFor(employee) {
+  if (employee?.adminOnly) return adminUsers();
   if (!employee?.brand || !employee?.branch) return [];
   const { rows } = await pool.query(
     `SELECT id, data FROM users WHERE data->>'role' = 'BRANCH_MANAGER'`
@@ -2004,6 +2022,7 @@ async function branchManagersFor(employee) {
 // Team Leaders and Supervisors over a call-centre employee's department —
 // the people notified when that person clocks in or out.
 async function deptManagersFor(employee) {
+  if (employee?.adminOnly) return adminUsers();
   const dept = nrm(employee?.companyName);
   if (!dept) return [];
   const { rows } = await pool.query(
@@ -2019,6 +2038,7 @@ function canSeeUser(viewer, t) {
   if (!viewer || !t) return false;
   if (viewer.role === 'ADMIN') return true;
   if (t.id === viewer.id) return true;
+  if (t.adminOnly) return false;
   if (!isBranchRole(viewer.role)) {
     // Department side: same company, department users only.
     return !isBranchRole(t.role) && !!nrm(t.companyName) && nrm(t.companyName) === nrm(viewer.companyName);
@@ -2045,6 +2065,7 @@ function canSeeUser(viewer, t) {
 function canWriteSchedule(viewer, t) {
   if (!viewer || !t) return false;
   if (viewer.role === 'ADMIN') return true;
+  if (t.adminOnly) return false;
   if (!isBranchRole(viewer.role)) {
     // Department managers/supervisors write within their department.
     return ['MANAGER', 'SUPERVISOR'].includes(viewer.role) &&
@@ -2076,6 +2097,7 @@ function canWriteSchedule(viewer, t) {
 function canManageUserAccount(viewer, t) {
   if (!viewer || !t) return false;
   if (viewer.role === 'ADMIN') return true;
+  if (t.adminOnly) return false;
   if (viewer.role === 'BRANCH_MANAGER') {
     return t.role === 'BRANCH_EMPLOYEE' &&
       nrm(t.brand) === nrm(viewer.brand) && nrm(t.branch) === nrm(viewer.branch);
@@ -2131,6 +2153,23 @@ function signToken(user) {
   );
 }
 
+// An account an admin deactivated (users.data.disabled) is refused on every
+// request, not only at login, so switching someone off reaches an app they
+// already have open. Every client polls every few seconds, hence the short
+// cache; an admin's change clears it at once (forgetDisabled).
+const ACCOUNT_DISABLED_MSG = 'This account has been deactivated. Contact your admin.';
+const disabledCache = new Map(); // userId -> { at, off }
+const DISABLED_CACHE_MS = 10 * 1000;
+async function isAccountDisabled(userId) {
+  const hit = disabledCache.get(userId);
+  if (hit && Date.now() - hit.at < DISABLED_CACHE_MS) return hit.off;
+  const { rows } = await pool.query(`SELECT data->>'disabled' AS d FROM users WHERE id = $1`, [userId]);
+  const off = rows[0]?.d === 'true';
+  disabledCache.set(userId, { at: Date.now(), off });
+  return off;
+}
+const forgetDisabled = (userId) => disabledCache.delete(userId);
+
 // Require a valid token; populates req.user.
 function authenticate(req, res, next) {
   const header = req.headers.authorization || '';
@@ -2138,10 +2177,15 @@ function authenticate(req, res, next) {
   if (!token) return res.status(401).json({ error: 'Authentication required' });
   try {
     req.user = jwt.verify(token, JWT_SECRET);
-    next();
   } catch {
     return res.status(401).json({ error: 'Invalid or expired session' });
   }
+  // A database hiccup must not log everyone out: the request goes on and
+  // fails (or not) on its own.
+  isAccountDisabled(req.user.id).then(
+    (off) => (off ? res.status(401).json({ error: ACCOUNT_DISABLED_MSG, disabled: true }) : next()),
+    () => next()
+  );
 }
 
 // Require the authenticated user to hold one of the given roles.
@@ -2195,6 +2239,8 @@ api.post('/login', wrap(async (req, res) => {
   if (!row) return res.json({ user: null });
   const ok = await bcrypt.compare(String(password || ''), String(row.data.password || ''));
   if (!ok) return res.json({ user: null });
+  // Told only after the right password, so it doesn't reveal which accounts exist.
+  if (row.data.disabled === true) return res.json({ user: null, disabled: true, error: ACCOUNT_DISABLED_MSG });
   const user = sanitizeUser(row);
   res.json({ user, token: signToken(user) });
 }));
@@ -2476,7 +2522,7 @@ api.get('/me', wrap(async (req, res) => {
 
 api.get('/users', wrap(async (req, res) => {
   const { rows } = await pool.query('SELECT id, data FROM users');
-  if (readAll(req)) return res.json(rows.map(sanitizeUser));
+  if (readAll(req)) return res.json(rows.filter((r) => !isHiddenFrom(req.user, { id: r.id, ...r.data })).map(sanitizeUser));
   const viewer = await getViewer(req);
   res.json(rows.filter((r) => canSeeUser(viewer, { id: r.id, ...r.data })).map(sanitizeUser));
 }));
@@ -2490,7 +2536,7 @@ api.get('/branch-directory', wrap(async (req, res) => {
     `SELECT id, data FROM users WHERE data->>'role' = ANY($1)`,
     [BRANCH_ROLES]
   );
-  res.json(rows.map(sanitizeUser));
+  res.json(rows.filter((r) => !isHiddenFrom(req.user, { id: r.id, ...r.data })).map(sanitizeUser));
 }));
 
 // ---- Department directory (Staff Directory page) ---------------------------
@@ -2506,7 +2552,7 @@ api.get('/staff-directory', wrap(async (req, res) => {
         AND COALESCE(data->>'name', '') <> ''`,
     [BRANCH_ROLES],
   );
-  res.json(rows.map((r) => ({
+  res.json(rows.filter((r) => !isHiddenFrom(req.user, { id: r.id, ...r.data })).map((r) => ({
     id: r.id,
     name: r.data.name,
     role: r.data.role,
@@ -2516,8 +2562,8 @@ api.get('/staff-directory', wrap(async (req, res) => {
 }));
 
 api.get('/branch-schedules', wrap(async (req, res) => {
-  const usersR = await pool.query(`SELECT id FROM users WHERE data->>'role' = ANY($1)`, [BRANCH_ROLES]);
-  const ids = new Set(usersR.rows.map((r) => r.id));
+  const usersR = await pool.query(`SELECT id, data FROM users WHERE data->>'role' = ANY($1)`, [BRANCH_ROLES]);
+  const ids = new Set(usersR.rows.filter((r) => !isHiddenFrom(req.user, { id: r.id, ...r.data })).map((r) => r.id));
   const schedR = await pool.query('SELECT user_id, date, data FROM schedules');
   const out = {};
   for (const r of schedR.rows) {
@@ -2532,6 +2578,8 @@ api.post('/users', requireRole(...USER_MGMT), wrap(async (req, res) => {
   const id = body.id || genId();
   delete body.id;
   if (!isAdmin(req)) {
+    delete body.adminOnly;
+    delete body.disabled;
     if (body.role === 'ADMIN') return res.status(403).json({ error: 'Only an admin can create an admin.' });
 
     if (BRANCH_USER_MGMT.includes(req.user.role)) {
@@ -2585,6 +2633,10 @@ api.put('/users/:id', requireRole(...USER_MGMT), wrap(async (req, res) => {
   delete incoming.id;
 
   if (!isAdmin(req)) {
+    // Only an admin sets these flags, and nobody else may touch an adminOnly account.
+    delete incoming.adminOnly;
+    delete incoming.disabled;
+    if (existing.adminOnly && id !== req.user.id) return res.status(404).json({ error: 'User not found' });
     if (incoming.role === 'ADMIN') return res.status(403).json({ error: 'Only an admin can grant admin.' });
 
     if (BRANCH_USER_MGMT.includes(req.user.role)) {
@@ -2627,6 +2679,10 @@ api.put('/users/:id', requireRole(...USER_MGMT), wrap(async (req, res) => {
     }
   }
 
+  if (incoming.disabled === true && id === req.user.id) {
+    return res.status(400).json({ error: 'You cannot deactivate your own account.' });
+  }
+
   // Preserve the existing password hash unless a new password was supplied.
   if (incoming.password) {
     incoming.password = await bcrypt.hash(String(incoming.password), 10);
@@ -2636,6 +2692,13 @@ api.put('/users/:id', requireRole(...USER_MGMT), wrap(async (req, res) => {
 
   const merged = { ...existing, ...incoming };
   await pool.query('UPDATE users SET data = $2::jsonb WHERE id = $1', [id, J(merged)]);
+  forgetDisabled(id);
+  const wasOff = existing.disabled === true, isOff = merged.disabled === true;
+  if (wasOff !== isOff) {
+    await logAudit(req, { action: isOff ? 'user.deactivate' : 'user.activate', entityType: 'user', entityId: id, summary: `${isOff ? 'Deactivated' : 'Reactivated'} ${merged.name || ''}` });
+    // Drop their live sockets now; the open app logs out on its next poll.
+    if (isOff) for (const ws of wsClientsByUser.get(id) || []) { try { ws.close(4001, ACCOUNT_DISABLED_MSG); } catch { /* gone */ } }
+  }
   await logAudit(req, { action: 'user.update', entityType: 'user', entityId: id, summary: `Edited account ${merged.name || ''}` });
   res.json(sanitizeUser({ id, data: merged }));
 }));
@@ -2674,10 +2737,14 @@ api.post('/change-password', wrap(async (req, res) => {
 api.get('/schedules', wrap(async (req, res) => {
   const rows = (await pool.query('SELECT user_id, date, data FROM schedules')).rows;
   let allowed = null; // null => everything
-  if (!readAll(req)) {
-    const viewer = await getViewer(req);
+  if (!isAdmin(req)) {
     const usersR = await pool.query('SELECT id, data FROM users');
-    allowed = new Set(usersR.rows.filter((r) => canSeeUser(viewer, { id: r.id, ...r.data })).map((r) => r.id));
+    if (readAll(req)) {
+      allowed = new Set(usersR.rows.filter((r) => !isHiddenFrom(req.user, { id: r.id, ...r.data })).map((r) => r.id));
+    } else {
+      const viewer = await getViewer(req);
+      allowed = new Set(usersR.rows.filter((r) => canSeeUser(viewer, { id: r.id, ...r.data })).map((r) => r.id));
+    }
   }
   const out = {};
   for (const r of rows) {
@@ -2838,7 +2905,11 @@ api.post('/schedule/parse', requireRole(...SCHED_MGMT), wrap(async (req, res) =>
   const parseRoles = ['EMPLOYEE'];
   if (req.user?.role === 'SUPERVISOR' || req.user?.role === 'ADMIN') parseRoles.push('MANAGER');
   if (BRANCH_MGMT.includes(req.user?.role)) parseRoles.push('BRANCH_EMPLOYEE', 'BRANCH_MANAGER', 'AREA_MANAGER');
-  const { rows } = await pool.query(`SELECT id, data->>'name' AS name FROM users WHERE data->>'role' = ANY($1)`, [parseRoles]);
+  const { rows } = await pool.query(
+    `SELECT id, data->>'name' AS name FROM users WHERE data->>'role' = ANY($1)
+       AND ($2 OR COALESCE(data->>'adminOnly', '') <> 'true')`,
+    [parseRoles, isAdmin(req)]
+  );
   const employees = rows.filter((r) => r.name);
 
   const prompt = `You convert a manager's natural-language instruction (Arabic or English) into a one-week shift schedule for ONE employee.
@@ -2886,8 +2957,10 @@ api.get('/swaps', wrap(async (req, res) => {
   const { rows } = await pool.query('SELECT id, data FROM swap_requests');
   let items = rows.map((r) => ({ ...r.data, id: r.id }));
   if (!isAdmin(req)) {
-    const ids = await deptUserIdSet(scopeDept(req));
-    items = items.filter((s) => ids.has(s.requesterId) || ids.has(s.targetId));
+    const [ids, hidden] = await Promise.all([deptUserIdSet(scopeDept(req)), adminOnlyUserIds()]);
+    const me = req.user.id;
+    items = items.filter((s) => (ids.has(s.requesterId) || ids.has(s.targetId)) &&
+      (s.requesterId === me || s.targetId === me || !(hidden.has(s.requesterId) || hidden.has(s.targetId))));
   }
   res.json(items);
 }));
@@ -2977,8 +3050,8 @@ api.get('/leaves', wrap(async (req, res) => {
   const { rows } = await pool.query('SELECT id, data FROM leave_requests ORDER BY created_at DESC NULLS LAST');
   let items = rows.map((r) => ({ ...r.data, id: r.id }));
   if (!isAdmin(req)) {
-    const ids = await deptUserIdSet(scopeDept(req));
-    items = items.filter((l) => ids.has(l.userId));
+    const [ids, hidden] = await Promise.all([deptUserIdSet(scopeDept(req)), adminOnlyUserIds()]);
+    items = items.filter((l) => ids.has(l.userId) && (l.userId === req.user.id || !hidden.has(l.userId)));
   }
   res.json(items);
 }));
@@ -3313,13 +3386,13 @@ api.post('/breaks/start', wrap(async (req, res) => {
 
   if (!inserted) {
     const { rows: peer } = await pool.query(
-      `SELECT u.data->>'name' name FROM breaks b JOIN users u ON u.id = b.user_id
+      `SELECT u.data->>'name' name, u.data->>'adminOnly' hidden FROM breaks b JOIN users u ON u.id = b.user_id
        WHERE b.ended_at IS NULL AND b.user_id <> $1
          AND u.data->>'role' = 'EMPLOYEE' AND lower(trim(u.data->>'companyName')) = $2
        ORDER BY b.started_at DESC LIMIT 1`,
       [req.user.id, dept]
     );
-    const name = peer[0]?.name || 'Someone on your team';
+    const name = (peer[0]?.hidden !== 'true' && peer[0]?.name) || 'Someone on your team';
     return res.status(409).json({ error: `${name} is already on a break — wait until they're back.` });
   }
 
@@ -4273,6 +4346,19 @@ api.get('/agent-kpis/missed', requireRole(...KPI_ROLES), wrap(async (req, res) =
   // may see; the rest show by username, and only to an admin).
   const byName = new Map(agents.filter((a) => a.agentName).map((a) => [a.agentName, a]));
   const linkedName = (xname) => { const a = byName.get(xname); return a ? a.user.name : null; };
+  // adminOnly people never surface by name here, not even as a raw XonTel
+  // username or the display name XonTel shows as the assignee.
+  const hiddenNames = new Set();
+  if (!admin) {
+    const { rows: hid } = await pool.query(
+      `SELECT u.data->>'name' AS name, m.xontel_agent_name AS xname
+         FROM users u LEFT JOIN xontel_agent_map m ON m.user_id = u.id
+        WHERE u.data->>'adminOnly' = 'true' AND u.id <> $1`, [req.user.id]
+    );
+    for (const h of hid) for (const n of [h.name, h.xname]) if (n) hiddenNames.add(nrm(n).replace(/[_.\-]+/g, ' '));
+  }
+  const isHiddenName = (n) => !!n && hiddenNames.has(nrm(n).replace(/[_.\-]+/g, ' '));
+  const shownName = (n) => (isHiddenName(n) ? 'Another agent' : n);
   const outcomeKey = (o) => { const s = String(o || '').toLowerCase(); return s === 'done' ? 'reached' : s === 'busy' ? 'busy' : /no\s*answer/.test(s) ? 'noAnswer' : 'other'; };
 
   const cbsByCall = new Map();
@@ -4287,17 +4373,17 @@ api.get('/agent-kpis/missed', requireRole(...KPI_ROLES), wrap(async (req, res) =
     // tried and got no one, and is still open — status alone is not "handled".
     const handled = !!c.closed;
     const cbs = (cbsByCall.get(c.id) || []).map((cb) => ({
-      agent: linkedName(cb.xontel_agent_name) || cb.xontel_agent_name || '', linked: !!linkedName(cb.xontel_agent_name),
+      agent: linkedName(cb.xontel_agent_name) || shownName(cb.xontel_agent_name) || '', linked: !!linkedName(cb.xontel_agent_name),
       outcome: cb.outcome || '', at: Number(cb.at_ts),
     }));
     const last = cbs[cbs.length - 1];
     return {
       id: c.id, missedTs, caller: c.caller || '', queue: c.queue || '',
-      handled, status: c.status || '', assignee: c.assignee || null, assignedTs,
+      handled, status: c.status || '', assignee: c.assignee ? shownName(c.assignee) : null, assignedTs,
       // Missed → first action, whether or not the customer was reached (an
       // open "Busy" row still says how long the customer waited for a try).
       waitSec: assignedTs ? Math.max(0, Math.round((assignedTs - missedTs) / 1000)) : null,
-      calledBackBy: last ? last.agent : (c.assignee || null),
+      calledBackBy: last ? last.agent : (c.assignee ? shownName(c.assignee) : null),
       callbacks: cbs,
     };
   });
@@ -4990,6 +5076,10 @@ api.get('/app-data', wrap(async (req, res) => {
   const viewer = admin ? null : await getViewer(req);
   const visible = (r) => admin || canSeeUser(viewer, { id: r.id, ...r.data });
   const allowedIds = new Set(usersR.rows.filter(visible).map((r) => r.id));
+  // A swap with an adminOnly person is shown only to the two people in it.
+  const hidden = new Set(usersR.rows.filter((r) => isHiddenFrom(req.user, { id: r.id, ...r.data })).map((r) => r.id));
+  const swapVisible = (s) => admin || ((allowedIds.has(s.requesterId) || allowedIds.has(s.targetId)) &&
+    (s.requesterId === req.user.id || s.targetId === req.user.id || !(hidden.has(s.requesterId) || hidden.has(s.targetId))));
 
   const schedules = {};
   for (const r of schedR.rows) {
@@ -4999,8 +5089,7 @@ api.get('/app-data', wrap(async (req, res) => {
 
   res.json({
     users: usersR.rows.filter(visible).map(sanitizeUser),
-    swapRequests: swapsR.rows.map((r) => ({ ...r.data, id: r.id }))
-      .filter((s) => admin || allowedIds.has(s.requesterId) || allowedIds.has(s.targetId)),
+    swapRequests: swapsR.rows.map((r) => ({ ...r.data, id: r.id })).filter(swapVisible),
     schedules,
     leaveRequests: leavesR.rows.map((r) => ({ ...r.data, id: r.id }))
       .filter((l) => admin || allowedIds.has(l.userId)),
@@ -5393,6 +5482,9 @@ function attachCallSignaling(httpServer) {
       ws.close(4001, 'Invalid or expired session');
       return;
     }
+    // A deactivated account: close straight after it registers (the check is
+    // async, and registering first keeps the rest of this handler unchanged).
+    isAccountDisabled(userId).then((off) => { if (off) { try { ws.close(4001, ACCOUNT_DISABLED_MSG); } catch { /* gone */ } } }, () => {});
 
     if (!wsClientsByUser.has(userId)) wsClientsByUser.set(userId, new Set());
     wsClientsByUser.get(userId).add(ws);

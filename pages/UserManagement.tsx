@@ -46,7 +46,9 @@ export default function UserManagement() {
     branch: '',
     branches: [] as string[],
     brands: [] as string[],
-    phone: ''
+    phone: '',
+    adminOnly: false,
+    disabled: false
   });
 
   // Dropdown options built from existing users.
@@ -91,7 +93,9 @@ export default function UserManagement() {
       branch: isBranchManagerViewer ? (currentUser?.branch || '') : '',
       branches: [],
       brands: [],
-      phone: ''
+      phone: '',
+      adminOnly: false,
+      disabled: false
     });
     setShowModal(true);
   };
@@ -112,7 +116,9 @@ export default function UserManagement() {
       branch: user.branch || '',
       branches: user.branches || [],
       brands: user.brands || [],
-      phone: user.phone || ''
+      phone: user.phone || '',
+      adminOnly: !!user.adminOnly,
+      disabled: !!user.disabled
     });
     setShowModal(true);
   };
@@ -130,8 +136,11 @@ export default function UserManagement() {
       alert('Select at least one brand for the Operation Manager.');
       return;
     }
+    // Only an admin sends these flags; the server drops them from anyone else.
+    const { adminOnly, disabled, ...rest } = formData;
     const trimmedData = {
-      ...formData,
+      ...rest,
+      ...(currentUser?.role === UserRole.ADMIN ? { adminOnly, disabled } : {}),
       name: formData.name.trim(),
       username: formData.username.trim(),
       jobTitle: formData.jobTitle.trim(),
@@ -247,7 +256,11 @@ export default function UserManagement() {
                         className={`w-9 h-9 rounded-full flex items-center justify-center font-bold border overflow-hidden ${u.role === UserRole.SUPERVISOR ? 'bg-purple-50 text-purple-600 border-purple-100' : 'bg-blue-50 text-blue-600 border-blue-100'}`}
                       />
                       <div>
-                        <p className="font-bold text-gray-900">{u.name}</p>
+                        <p className="font-bold text-gray-900">
+                          {u.name}
+                          {u.disabled && <span className="ml-2 align-middle text-[10px] font-black uppercase tracking-wide px-1.5 py-0.5 rounded bg-rose-50 text-rose-600 border border-rose-100">Deactivated</span>}
+                          {u.adminOnly && <span className="ml-2 align-middle text-[10px] font-black uppercase tracking-wide px-1.5 py-0.5 rounded bg-gray-100 text-gray-600 border border-gray-200">Admin only</span>}
+                        </p>
                         <p className="text-xs text-gray-400">@{u.username}</p>
                       </div>
                     </div>
@@ -569,6 +582,30 @@ export default function UserManagement() {
                   </div>
                 )}
               </div>
+              {currentUser?.role === UserRole.ADMIN && (
+                <label className="mt-6 flex items-start gap-3 p-4 rounded-2xl border border-gray-100 bg-gray-50 cursor-pointer">
+                  <input
+                    type="checkbox" className="mt-1 w-4 h-4 accent-blue-600"
+                    checked={formData.adminOnly} onChange={e => setFormData({ ...formData, adminOnly: e.target.checked })}
+                  />
+                  <span>
+                    <span className="block text-sm font-bold text-gray-900">Visible to admins only</span>
+                    <span className="block text-xs text-gray-500 mt-0.5">Hides this person and their schedule, breaks, requests, attendance and call figures from everyone except admins. They still see their own.</span>
+                  </span>
+                </label>
+              )}
+              {currentUser?.role === UserRole.ADMIN && editingUserId && editingUserId !== currentUser.id && (
+                <label className={`mt-3 flex items-start gap-3 p-4 rounded-2xl border cursor-pointer ${formData.disabled ? 'border-rose-200 bg-rose-50' : 'border-gray-100 bg-gray-50'}`}>
+                  <input
+                    type="checkbox" className="mt-1 w-4 h-4 accent-rose-600"
+                    checked={formData.disabled} onChange={e => setFormData({ ...formData, disabled: e.target.checked })}
+                  />
+                  <span>
+                    <span className={`block text-sm font-bold ${formData.disabled ? 'text-rose-700' : 'text-gray-900'}`}>Deactivate account</span>
+                    <span className="block text-xs text-gray-500 mt-0.5">They are signed out within seconds and can't sign in again until you untick this. Their schedule and history stay as they are.</span>
+                  </span>
+                </label>
+              )}
               <div className="flex justify-end pt-6">
                 <button type="submit" className="bg-[#2563EB] text-white px-12 py-4 rounded-2xl font-black text-sm uppercase tracking-widest shadow-xl shadow-blue-200 hover:bg-blue-700 transition-all active:scale-95">
                   {editingUserId ? 'Save Changes' : 'Create User'}

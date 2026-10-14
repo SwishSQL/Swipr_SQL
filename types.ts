@@ -106,6 +106,10 @@ export interface User {
   companyName?: string;
   managerName?: string;
   teamLeader?: string;
+  // Visible to admins only (and the person themself) — set by an admin.
+  adminOnly?: boolean;
+  // Deactivated by an admin: can't sign in or use the app until reactivated.
+  disabled?: boolean;
   annualBalance?: number;
   publicBalance?: number;
   managedDepartments?: string[];
