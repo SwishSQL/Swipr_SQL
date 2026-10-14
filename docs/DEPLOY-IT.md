@@ -7,7 +7,7 @@ live call signalling (WebSocket). Everything is stored in ONE SQL Server databas
 |---|---|
 | SQL Server | 2016 or newer (tested on SQL Server 2025) |
 | Node.js | 20 or newer, with npm |
-| Default port | 8080 (`PORT` in `.env`) |
+| Port / address | **6006** (`PORT` in `.env`) / `https://swipr.swishhh.net` |
 
 ---
 
@@ -88,7 +88,7 @@ A good start ends with:
 ```
 [qa] Quality module mounted at /api/qa
 [db] schema ready
-[server] listening on :8080
+[server] listening on :6006
 ```
 
 Run it as a service with your usual tool (NSSM / pm2 / Windows Service / systemd) using `npm start` in the project folder.
