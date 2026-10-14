@@ -1,7 +1,7 @@
-// Swish Schedule — Express + PostgreSQL backend
+// Swish Schedule — Express + SQL Server backend
 // Serves the built Vite SPA and exposes a REST API under /api
 import express from 'express';
-import pg from 'pg';
+import { pool, initDatabase, verifySchema } from './db.js';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
@@ -16,9 +16,7 @@ import { getMessaging } from 'firebase-admin/messaging';
 import compression from 'compression';
 import QRCode from 'qrcode';
 import { WebSocketServer } from 'ws';
-import { runFirestoreMigration, runWeeksImport, runDeptImport } from './migrate.js';
 
-const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -195,7 +193,7 @@ async function recomputeLateness({ userIds, fromDate, toDate }) {
   const { rows: dupRows } = await pool.query(
     `SELECT data->>'employeeId' AS eid FROM users
       WHERE coalesce(data->>'employeeId','') <> ''
-      GROUP BY 1 HAVING count(*) > 1`
+      GROUP BY data->>'employeeId' HAVING count(*) > 1`
   );
   const ambiguous = new Set(dupRows.map((r) => r.eid));
 
@@ -1097,7 +1095,7 @@ async function xontelReconcileBreaks(live) {
   );
   const activeOf = new Map(active.map((b) => [b.user_id, b]));
   const { rows: held } = await pool.query(
-    `SELECT DISTINCT user_id FROM breaks WHERE xontel_hold AND user_id = ANY($1)`, [userIds]
+    `SELECT DISTINCT user_id FROM breaks WHERE xontel_hold = 1 AND user_id = ANY($1)`, [userIds]
   );
   const holding = new Set(held.map((h) => h.user_id));
   const now = Date.now();
@@ -1124,7 +1122,7 @@ async function xontelReconcileBreaks(live) {
         }
       } else {
         if (holding.has(m.user_id)) {
-          await pool.query(`UPDATE breaks SET xontel_hold = false WHERE user_id = $1 AND xontel_hold`, [m.user_id]);
+          await pool.query(`UPDATE breaks SET xontel_hold = 0 WHERE user_id = $1 AND xontel_hold = 1`, [m.user_id]);
         }
         // Back on XonTel. A break never seen away on XonTel is one pressed in
         // Swipr only, and XonTel's "ready" says nothing about it.
@@ -1436,501 +1434,28 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
 // ---------------------------------------------------------------------------
 // Database
 // ---------------------------------------------------------------------------
-function sslConfig() {
-  const url = process.env.DATABASE_URL || '';
-  // No SSL for local dev or Railway's private network; SSL for public proxies.
-  if (!url || /localhost|127\.0\.0\.1|\.railway\.internal/.test(url)) return false;
-  return { rejectUnauthorized: false };
-}
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: sslConfig(),
-});
+// The data layer is db.js (SQL Server). The application never issues DDL: every table, index and view comes from
+// sql/schema.sql — run by the DBA / `npm run db:init`, or by the app itself when AUTO_INIT_DB=true.
+const REQUIRED_OBJECTS = [
+  'users', 'schedules', 'swap_requests', 'leave_requests', 'public_holidays', 'shift_templates', 'audit_log', 'notifications',
+  'evaluations', 'breaks', 'break_freezes', 'overtime_sessions', 'kpi_targets', 'attendance', 'attendance_suppressed',
+  'attendance_daily', 'sync_state', 'xontel_agent_map', 'xontel_sessions', 'xontel_calls', 'xontel_missed_calls',
+  'xontel_callbacks', 'push_subscriptions', 'fcm_tokens', 'call_logs', 'sick_documents', 'call_recordings', '_migrations',
+];
+const QA_OBJECTS = ['qa_user_profile', 'qa_users', 'qa_evaluations', 'qa_attendance_records'];
 
 async function initDb() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id   TEXT PRIMARY KEY,
-      data JSONB NOT NULL
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS users_username_idx ON users ((data->>'username'));
-
-    CREATE TABLE IF NOT EXISTS schedules (
-      user_id TEXT NOT NULL,
-      date    TEXT NOT NULL,
-      data    JSONB NOT NULL,
-      PRIMARY KEY (user_id, date)
-    );
-
-    CREATE TABLE IF NOT EXISTS swap_requests (
-      id   TEXT PRIMARY KEY,
-      data JSONB NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS leave_requests (
-      id         TEXT PRIMARY KEY,
-      data       JSONB NOT NULL,
-      created_at BIGINT
-    );
-
-    CREATE TABLE IF NOT EXISTS public_holidays (
-      id   TEXT PRIMARY KEY,
-      data JSONB NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS shift_templates (
-      id   TEXT PRIMARY KEY,
-      data JSONB NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS audit_log (
-      id          TEXT PRIMARY KEY,
-      ts          BIGINT NOT NULL,
-      actor_id    TEXT,
-      actor_name  TEXT,
-      action      TEXT,
-      entity_type TEXT,
-      entity_id   TEXT,
-      summary     TEXT,
-      details     JSONB
-    );
-    CREATE INDEX IF NOT EXISTS audit_log_ts_idx ON audit_log (ts DESC);
-
-    CREATE TABLE IF NOT EXISTS notifications (
-      id         TEXT PRIMARY KEY,
-      user_id    TEXT NOT NULL,
-      type       TEXT,
-      title      TEXT,
-      body       TEXT,
-      created_at BIGINT,
-      read_at    BIGINT
-    );
-    CREATE INDEX IF NOT EXISTS notifications_user_idx ON notifications (user_id, created_at DESC);
-
-    CREATE TABLE IF NOT EXISTS evaluations (
-      id          TEXT PRIMARY KEY,
-      employee_id TEXT NOT NULL,
-      data        JSONB NOT NULL,
-      created_at  BIGINT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS evaluations_employee_idx ON evaluations (employee_id, created_at DESC);
-
-    CREATE TABLE IF NOT EXISTS breaks (
-      id            TEXT PRIMARY KEY,
-      user_id       TEXT NOT NULL,
-      started_at    BIGINT NOT NULL,
-      ended_at      BIGINT,
-      ended_by_id   TEXT,
-      ended_by_name TEXT,
-      ended_by_role TEXT
-    );
-    CREATE INDEX IF NOT EXISTS breaks_user_idx ON breaks (user_id, started_at DESC);
-    -- A user can only ever have one break running at a time.
-    CREATE UNIQUE INDEX IF NOT EXISTS breaks_one_active_idx ON breaks (user_id) WHERE ended_at IS NULL;
-    -- Where a break came from. 'swipr' is the Start Break button, 'xontel' is a
-    -- break status the agent set on XonTel that the sync mirrored here.
-    -- xontel_session_id links a break to the XonTel status session seen for
-    -- it (also set on a Swipr break once XonTel shows them on break too), so
-    -- XonTel returning to ready can end it, and an ended one is never reopened
-    -- from the same session.
-    ALTER TABLE breaks ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'swipr';
-    ALTER TABLE breaks ADD COLUMN IF NOT EXISTS xontel_session_id TEXT;
-    ALTER TABLE breaks ADD COLUMN IF NOT EXISTS xontel_status TEXT;
-    CREATE INDEX IF NOT EXISTS breaks_xontel_session_idx ON breaks (xontel_session_id) WHERE xontel_session_id IS NOT NULL;
-    -- Set when a break is ended from Swipr while XonTel still shows the agent
-    -- away. Until XonTel shows them back, the live tick must not reopen it.
-    ALTER TABLE breaks ADD COLUMN IF NOT EXISTS xontel_hold BOOLEAN NOT NULL DEFAULT false;
-
-    -- A manager freezing Start Break for their whole scope (their department,
-    -- or their branch) for a stretch of time — a rush, a huddle, a shift
-    -- handover. scope_key is the same normalised department name, or
-    -- "brand::branch", that canManageBreak already scopes by, so a freeze and
-    -- a manager's own reach always agree on what "their scope" means. Only
-    -- blocks NEW breaks from starting; a break already running is untouched.
-    CREATE TABLE IF NOT EXISTS break_freezes (
-      id              TEXT PRIMARY KEY,
-      scope_type      TEXT NOT NULL,
-      scope_key       TEXT NOT NULL,
-      starts_at       BIGINT NOT NULL,
-      ends_at         BIGINT NOT NULL,
-      reason          TEXT,
-      created_by_id   TEXT,
-      created_by_name TEXT,
-      created_at      BIGINT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS break_freezes_scope_idx ON break_freezes (scope_type, scope_key, ends_at);
-
-    -- KPI targets a lead sets for the Agent performance page; defaults live
-    -- in code (KPI_TARGET_DEFAULTS), only overrides are stored.
-    CREATE TABLE IF NOT EXISTS kpi_targets (
-      key        TEXT PRIMARY KEY,
-      value      DOUBLE PRECISION NOT NULL,
-      updated_by TEXT,
-      updated_at BIGINT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS attendance (
-      id      TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      kind    TEXT NOT NULL,
-      ts      BIGINT NOT NULL,
-      brand   TEXT,
-      branch  TEXT
-    );
-    CREATE INDEX IF NOT EXISTS attendance_user_idx ON attendance (user_id, ts DESC);
-    -- Call-centre staff clock in against a department, not a brand/branch.
-    ALTER TABLE attendance ADD COLUMN IF NOT EXISTS department TEXT;
-
-    -- Terminal punches an admin deleted. The fingerprint sync re-derives rows
-    -- from the raw terminal data every cycle, so without this a removed punch
-    -- would simply come back; the sync skips any (user, ts) listed here.
-    CREATE TABLE IF NOT EXISTS attendance_suppressed (
-      user_id TEXT   NOT NULL,
-      ts      BIGINT NOT NULL,
-      PRIMARY KEY (user_id, ts)
-    );
-
-    -- One row per scheduled working day per person: what the roster expected
-    -- against what the terminal recorded. Derived and rebuilt from scratch on
-    -- every sync, so it is keyed by (user_id, date) and never by attendance.id
-    -- — fingerprint rows are deleted and re-inserted whole on each sync.
-    -- The verdict here is a SUGGESTION. The record of truth stays the schedule
-    -- row, which only a human writes; see POST /attendance/lateness/review.
-    CREATE TABLE IF NOT EXISTS attendance_daily (
-      user_id         TEXT NOT NULL,
-      date            TEXT NOT NULL,
-      scheduled_start BIGINT,
-      scheduled_end   BIGINT,
-      arrival_ts      BIGINT,
-      departure_ts    BIGINT,
-      offset_min      INTEGER,
-      early_leave_min INTEGER,
-      punch_count     INTEGER NOT NULL DEFAULT 0,
-      status          TEXT NOT NULL,
-      day_type        TEXT,
-      computed_at     BIGINT NOT NULL,
-      -- Survives recomputation: a human decision is never overwritten by the
-      -- engine re-running.
-      reviewed_by     TEXT,
-      reviewed_name   TEXT,
-      reviewed_at     BIGINT,
-      review_action   TEXT,
-      PRIMARY KEY (user_id, date)
-    );
-    CREATE INDEX IF NOT EXISTS attendance_daily_date_idx ON attendance_daily (date);
-    CREATE INDEX IF NOT EXISTS attendance_daily_status_idx ON attendance_daily (status);
-
-    -- A single row recording when the fingerprint bridge last delivered data.
-    -- Without it a stalled bridge is indistinguishable from an empty floor,
-    -- and the engine would report the whole shift as no-shows.
-    CREATE TABLE IF NOT EXISTS sync_state (
-      id           TEXT PRIMARY KEY,
-      last_sync_at BIGINT,
-      last_punch_ts BIGINT,
-      detail       JSONB
-    );
-
-    -- XonTel (the call-centre PBX layer) is the second clock. The fingerprint
-    -- says when someone reached the building; the XonTel login says when they
-    -- started taking calls. A XonTel agent account is linked to a Swipr user
-    -- once, here — most links are suggested from the name and confirmed by an
-    -- admin, exactly as the QA system does it.
-    CREATE TABLE IF NOT EXISTS xontel_agent_map (
-      user_id           TEXT PRIMARY KEY,
-      xontel_agent_id   TEXT NOT NULL,
-      xontel_agent_name TEXT,
-      confirmed_by      TEXT,
-      updated_at        BIGINT NOT NULL
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS xontel_agent_map_agent_idx ON xontel_agent_map (xontel_agent_id);
-
-    -- One row per status session as XonTel reports it (login, break, pause…),
-    -- keyed by XonTel's own id so a re-fetch updates rather than duplicates.
-    -- The raw row is kept: the API is undocumented, and the parsed columns
-    -- may need re-deriving once more of its vocabulary has been seen.
-    CREATE TABLE IF NOT EXISTS xontel_sessions (
-      id              TEXT PRIMARY KEY,
-      xontel_agent_id TEXT NOT NULL,
-      xontel_agent_name TEXT,
-      status          TEXT NOT NULL,
-      start_ts        BIGINT NOT NULL,
-      end_ts          BIGINT,
-      duration_sec    INTEGER,
-      raw             JSONB,
-      fetched_at      BIGINT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS xontel_sessions_agent_idx ON xontel_sessions (xontel_agent_id, start_ts);
-    CREATE INDEX IF NOT EXISTS xontel_sessions_start_idx ON xontel_sessions (start_ts);
-
-    -- Real calls, from the CDR. Separate from xontel_sessions because a
-    -- status and a call are different things: the "in call" STATUS keeps
-    -- running until the agent changes it, and has been seen sitting at 87
-    -- minutes with not one call underneath it. Anything anyone acts on —
-    -- talk time, call counts — comes from here.
-    CREATE TABLE IF NOT EXISTS xontel_calls (
-      id              TEXT PRIMARY KEY,
-      xontel_agent_id TEXT,
-      agent_name      TEXT,
-      start_ts        BIGINT NOT NULL,
-      -- duration covers ringing too; talk_sec (Asterisk billsec) is the part
-      -- they were actually speaking, and is 0 for a call nobody answered.
-      duration_sec    INTEGER NOT NULL DEFAULT 0,
-      talk_sec        INTEGER NOT NULL DEFAULT 0,
-      direction       TEXT,
-      status          TEXT,
-      caller_number   TEXT,
-      queue           TEXT,
-      recording_url   TEXT,
-      fetched_at      BIGINT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS xontel_calls_agent_idx ON xontel_calls (xontel_agent_id, start_ts);
-    CREATE INDEX IF NOT EXISTS xontel_calls_start_idx ON xontel_calls (start_ts);
-
-    -- Customer calls abandoned in a queue, as XonTel's own "Missed Calls"
-    -- dashboard lists them — a queue-level list, distinct from a call that
-    -- rang one agent (that is xontel_calls). XonTel keeps only a recent window
-    -- of these, so every poll stores what it sees; status flips Pending→Done
-    -- in place when an agent is assigned. Raw kept, the API being undocumented.
-    CREATE TABLE IF NOT EXISTS xontel_missed_calls (
-      id          TEXT PRIMARY KEY,
-      uniqueid    TEXT,
-      caller      TEXT,
-      queue       TEXT,
-      status      TEXT NOT NULL,
-      missed_ts   BIGINT NOT NULL,
-      assignee    TEXT,
-      assigned_ts BIGINT,
-      closed      BOOLEAN NOT NULL DEFAULT false,
-      raw         JSONB,
-      fetched_at  BIGINT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS xontel_missed_calls_ts_idx ON xontel_missed_calls (missed_ts);
-
-    -- One row per call-back an agent made for one of those calls, with the
-    -- outcome XonTel recorded (Done / Busy / No Answer). agent is the XonTel
-    -- username, the same string xontel_agent_map.xontel_agent_name holds.
-    CREATE TABLE IF NOT EXISTS xontel_callbacks (
-      id                TEXT PRIMARY KEY,
-      call_id           TEXT,
-      xontel_agent_name TEXT,
-      caller            TEXT,
-      outcome           TEXT,
-      at_ts             BIGINT NOT NULL,
-      raw               JSONB,
-      fetched_at        BIGINT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS xontel_callbacks_at_idx ON xontel_callbacks (at_ts);
-    CREATE INDEX IF NOT EXISTS xontel_callbacks_call_idx ON xontel_callbacks (call_id);
-
-    CREATE TABLE IF NOT EXISTS push_subscriptions (
-      id         TEXT PRIMARY KEY,
-      user_id    TEXT NOT NULL,
-      endpoint   TEXT NOT NULL UNIQUE,
-      keys       JSONB NOT NULL,
-      created_at BIGINT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS push_subscriptions_user_idx ON push_subscriptions (user_id);
-
-    -- Separate from push_subscriptions: an FCM token is Google's delivery
-    -- channel for the native Android app, not a Web Push subscription, and
-    -- one token replaces the last for a given user+device rather than
-    -- accumulating (a fresh token from Firebase invalidates the old one).
-    CREATE TABLE IF NOT EXISTS fcm_tokens (
-      id         TEXT PRIMARY KEY,
-      user_id    TEXT NOT NULL,
-      token      TEXT NOT NULL UNIQUE,
-      created_at BIGINT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS fcm_tokens_user_idx ON fcm_tokens (user_id);
-
-    -- One row per call attempt, written the moment a call is offered so that
-    -- calls nobody answered are recorded too — that is the whole point of the
-    -- admin call log. ring_delivered distinguishes "we never reached their
-    -- device" from "it rang and they didn't pick up".
-    CREATE TABLE IF NOT EXISTS call_logs (
-      id             TEXT PRIMARY KEY,
-      started_at     BIGINT NOT NULL,
-      answered_at    BIGINT,
-      ended_at       BIGINT,
-      duration_sec   INTEGER NOT NULL DEFAULT 0,
-      caller_id      TEXT NOT NULL,
-      caller_name    TEXT NOT NULL,
-      callee_id      TEXT NOT NULL,
-      callee_name    TEXT NOT NULL,
-      status         TEXT NOT NULL,
-      ring_delivered BOOLEAN NOT NULL DEFAULT FALSE,
-      push_sent      BOOLEAN NOT NULL DEFAULT FALSE,
-      ended_by       TEXT
-    );
-    CREATE INDEX IF NOT EXISTS call_logs_started_idx ON call_logs (started_at DESC);
-    CREATE INDEX IF NOT EXISTS call_logs_caller_idx ON call_logs (caller_id);
-    CREATE INDEX IF NOT EXISTS call_logs_callee_idx ON call_logs (callee_id);
-
-    -- Medical reports an employee uploads for a sick day. Readable by the
-    -- uploader and Admin only — never by their Team Leader or Supervisor.
-    -- The file sits in its own column and every list query leaves it out.
-    CREATE TABLE IF NOT EXISTS sick_documents (
-      id         TEXT PRIMARY KEY,
-      user_id    TEXT NOT NULL,
-      date       TEXT NOT NULL,
-      filename   TEXT,
-      mime       TEXT NOT NULL,
-      bytes      INTEGER NOT NULL,
-      note       TEXT,
-      created_at BIGINT NOT NULL,
-      data       BYTEA NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS sick_documents_user_idx ON sick_documents (user_id, date);
-    CREATE INDEX IF NOT EXISTS sick_documents_date_idx ON sick_documents (date);
-
-    -- Audio lives in its own table so listing the log never drags blobs along.
-    CREATE TABLE IF NOT EXISTS call_recordings (
-      call_id    TEXT PRIMARY KEY,
-      mime       TEXT NOT NULL,
-      bytes      INTEGER NOT NULL,
-      created_at BIGINT NOT NULL,
-      audio      BYTEA NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS _migrations (
-      name    TEXT PRIMARY KEY,
-      done_at BIGINT
-    );
-  `);
- 
-  // Quality (QA) module tables: idempotent, runs after the users table exists. QA_MODULE=off skips it.
-  if (process.env.QA_MODULE !== 'off') {
-    await pool.query(fs.readFileSync(path.join(__dirname, 'qa', 'schema.sql'), 'utf8'));
+  if (process.env.AUTO_INIT_DB === 'true') {
+    const n = await initDatabase({ createDatabase: true });
+    console.log(`[db] schema applied (${n} batches)`);
   }
- console.log('[db] schema ready');
+  await verifySchema(process.env.QA_MODULE === 'off' ? REQUIRED_OBJECTS : [...REQUIRED_OBJECTS, ...QA_OBJECTS]);
+  console.log('[db] schema ready');
 }
 
 // ---------------------------------------------------------------------------
-// One-time Firestore -> Postgres import (cloud-side, survives client offline).
-// Enabled by RUN_FIRESTORE_MIGRATION=true. Retries every 10 min until the old
-// Firestore quota frees up, then records completion and stops.
+// The one-off Firestore / week / department imports of the PostgreSQL edition are not part of this edition.
 // ---------------------------------------------------------------------------
-async function maybeRunFirestoreMigration() {
-  if (process.env.RUN_FIRESTORE_MIGRATION !== 'true') return;
-
-  const done = await pool.query(`SELECT 1 FROM _migrations WHERE name = 'firestore-import'`);
-  if (done.rowCount) {
-    console.log('[migrate] firestore-import already completed; skipping');
-    return;
-  }
-
-  let attempts = 0;
-  let timer = null;
-  const attempt = async () => {
-    attempts++;
-    try {
-      console.log(`[migrate] attempt #${attempts}: importing from Firestore...`);
-      const summary = await runFirestoreMigration(pool);
-      await pool.query(
-        `INSERT INTO _migrations (name, done_at) VALUES ('firestore-import', $1)
-         ON CONFLICT (name) DO NOTHING`,
-        [Date.now()]
-      );
-      console.log('[migrate] SUCCESS:', JSON.stringify({
-        users: summary.users.ok,
-        scheduleDays: summary.schedules.ok,
-        swaps: summary.swaps.ok,
-        leaves: summary.leaves.ok,
-        holidays: summary.holidays.ok,
-        errors: summary.errorCount,
-      }));
-      if (timer) clearInterval(timer);
-    } catch (e) {
-      console.log(`[migrate] not ready (attempt #${attempts}): ${e.message}`);
-    }
-  };
-
-  // First try shortly after boot, then every 10 minutes.
-  setTimeout(attempt, 5000);
-  timer = setInterval(attempt, 10 * 60 * 1000);
-}
-
-// ---------------------------------------------------------------------------
-// One-off single-week schedule import (cloud-side). Set IMPORT_WEEK_START to a
-// Sunday date (YYYY-MM-DD); retries every 10 min until the Firestore quota
-// frees, imports that week's 7 days, records a marker, and stops.
-// ---------------------------------------------------------------------------
-async function maybeRunWeekImport() {
-  const raw = process.env.IMPORT_WEEK_START;
-  if (!raw) return;
-  const weeks = raw.split(',').map((s) => s.trim()).filter(Boolean);
-  if (!weeks.length) return;
-
-  // Marker keyed on the exact value: change the var to force a fresh re-sync.
-  const marker = `weekimport:${weeks.slice().sort().join(',')}`;
-  const done = await pool.query('SELECT 1 FROM _migrations WHERE name = $1', [marker]);
-  if (done.rowCount) {
-    console.log(`[week-import] ${marker} already done; skipping`);
-    return;
-  }
-
-  let attempts = 0;
-  let timer = null;
-  const attempt = async () => {
-    attempts++;
-    try {
-      console.log(`[week-import] attempt #${attempts} for weeks: ${weeks.join(', ')}`);
-      const r = await runWeeksImport(pool, weeks);
-      await pool.query(
-        `INSERT INTO _migrations (name, done_at) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING`,
-        [marker, Date.now()]
-      );
-      console.log(`[week-import] SUCCESS: ${r.daysCopied} day-rows across ${weeks.length} week(s) (${r.usersTouched} employees)`);
-      if (timer) clearInterval(timer);
-    } catch (e) {
-      console.log(`[week-import] not ready (attempt #${attempts}): ${e.message}`);
-    }
-  };
-
-  setTimeout(attempt, 8000);
-  timer = setInterval(attempt, 10 * 60 * 1000);
-}
-
-// ---------------------------------------------------------------------------
-// One-off department schedule import (cloud-side). Set IMPORT_DEPTS to a
-// comma-separated list of company names; retries every 10 min until Firestore
-// is readable, imports those employees' full schedules, records a marker.
-// ---------------------------------------------------------------------------
-async function maybeRunDeptImport() {
-  const raw = process.env.IMPORT_DEPTS;
-  if (!raw) return;
-  const companies = raw.split(',').map((s) => s.trim()).filter(Boolean);
-  if (!companies.length) return;
-
-  const marker = `deptimport:${companies.slice().sort().join(',').toLowerCase()}`;
-  const done = await pool.query('SELECT 1 FROM _migrations WHERE name = $1', [marker]);
-  if (done.rowCount) {
-    console.log(`[dept-import] ${marker} already done; skipping`);
-    return;
-  }
-
-  let attempts = 0;
-  let timer = null;
-  const attempt = async () => {
-    attempts++;
-    try {
-      console.log(`[dept-import] attempt #${attempts} for depts: ${companies.join(', ')}`);
-      const r = await runDeptImport(pool, companies);
-      await pool.query(
-        `INSERT INTO _migrations (name, done_at) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING`,
-        [marker, Date.now()]
-      );
-      console.log(`[dept-import] SUCCESS: ${r.daysCopied} day-rows for ${r.usersTouched}/${r.userCount} employees`);
-      if (timer) clearInterval(timer);
-    } catch (e) {
-      console.log(`[dept-import] not ready (attempt #${attempts}): ${e.message}`);
-    }
-  };
-
-  setTimeout(attempt, 9000);
-  timer = setInterval(attempt, 10 * 60 * 1000);
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -4649,7 +4174,7 @@ const KPI_TARGET_BOUNDS = {
   ahtMaxSec: [30, 3600], breakMaxSecPerDay: [0, 8 * 3600], pickupMinPct: [0, 100], adherenceMinPct: [0, 100], lateLoginMaxMin: [0, 240],
 };
 async function kpiTargets() {
-  const { rows } = await pool.query('SELECT key, value FROM kpi_targets');
+  const { rows } = await pool.query('SELECT [key], value FROM kpi_targets');
   const t = { ...KPI_TARGET_DEFAULTS };
   for (const r of rows) if (r.key in t) t[r.key] = Number(r.value);
   return t;
@@ -6014,9 +5539,6 @@ initDb()
     } else {
       console.warn('[xontel] XONTEL_TOKEN or XONTEL_USERNAME/XONTEL_PASSWORD not set — the XonTel comparison stays hidden until they are.');
     }
-    maybeRunFirestoreMigration().catch((e) => console.error('[migrate] setup error', e));
-    maybeRunWeekImport().catch((e) => console.error('[week-import] setup error', e));
-    maybeRunDeptImport().catch((e) => console.error('[dept-import] setup error', e));
   })
   .catch((err) => {
     console.error('[fatal] could not initialise database', err);
