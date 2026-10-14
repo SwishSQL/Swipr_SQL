@@ -35,3 +35,5 @@ run-migration-when-ready.sh
 qa-dist/
 qa-ui-dist/
 qa-ui/node_modules/
+_boot.err
+_boot.log
