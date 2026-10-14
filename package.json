@@ -1,0 +1,53 @@
+{
+  "name": "swish-schedule",
+  "private": true,
+  "version": "1.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "vite",
+    "dev:server": "node server.js",
+    "build": "vite build && npm run build:qa && npm run build:qa-ui",
+    "start": "node server.js",
+    "preview": "vite preview",
+    "lint": "tsc --noEmit",
+    "build:qa-ui": "npm --prefix qa-ui install --no-audit --no-fund && npm --prefix qa-ui run build",
+    "build:qa": "esbuild qa/index.ts --bundle --platform=node --format=esm --packages=external --tsconfig=qa/tsconfig.json --outfile=qa-dist/qa.mjs"
+  },
+  "dependencies": {
+    "@capacitor/core": "^8.5.1",
+    "@capacitor/push-notifications": "^8.1.2",
+    "bcryptjs": "^2.4.3",
+    "cloudinary": "^2.11.0",
+    "compression": "^1.8.1",
+    "date-fns": "^4.1.0",
+    "express": "^4.19.2",
+    "firebase-admin": "^14.3.0",
+    "jsonwebtoken": "^9.0.3",
+    "lucide-react": "^0.463.0",
+    "multer": "^2.4.0",
+    "pg": "^8.11.5",
+    "qrcode": "^1.5.4",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.1.0",
+    "web-push": "^3.6.7",
+    "ws": "^8.21.3",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "esbuild": "^0.28.2",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.15",
+    "tailwindcss-animate": "^1.0.7",
+    "typescript": "^5.6.0",
+    "vite": "^6.0.0"
+  }
+}

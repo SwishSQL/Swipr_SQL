@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3B82F6"/>
+      <stop offset="1" stop-color="#2563EB"/>
+    </linearGradient>
+    <clipPath id="cal"><rect x="13" y="17" width="38" height="33" rx="5"/></clipPath>
+  </defs>
+  <rect width="64" height="64" rx="15" fill="url(#bg)"/>
+  <!-- binding tabs -->
+  <rect x="23" y="11" width="5" height="11" rx="2.5" fill="#ffffff"/>
+  <rect x="36" y="11" width="5" height="11" rx="2.5" fill="#ffffff"/>
+  <!-- calendar body + header band -->
+  <g clip-path="url(#cal)">
+    <rect x="13" y="17" width="38" height="33" fill="#ffffff"/>
+    <rect x="13" y="17" width="38" height="10" fill="#1D4ED8"/>
+  </g>
+  <!-- day cells -->
+  <g>
+    <rect x="19" y="31" width="6" height="5" rx="1.5" fill="#3B82F6"/>
+    <rect x="29" y="31" width="6" height="5" rx="1.5" fill="#3B82F6"/>
+    <rect x="39" y="31" width="6" height="5" rx="1.5" fill="#CBD5E1"/>
+    <rect x="19" y="40" width="6" height="5" rx="1.5" fill="#CBD5E1"/>
+    <rect x="29" y="40" width="6" height="5" rx="1.5" fill="#2563EB"/>
+    <rect x="39" y="40" width="6" height="5" rx="1.5" fill="#3B82F6"/>
+  </g>
+</svg>

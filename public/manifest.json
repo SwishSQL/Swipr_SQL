@@ -1,0 +1,19 @@
+{
+  "name": "Swipr - Staff Scheduler",
+  "short_name": "Swipr",
+  "description": "Staff scheduling, attendance and in-system calls.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#F8FAFC",
+  "theme_color": "#2563EB",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
