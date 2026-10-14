@@ -14,7 +14,10 @@
     "preview": "vite preview",
     "lint": "tsc --noEmit",
     "build:qa-ui": "npm --prefix qa-ui install --no-audit --no-fund && npm --prefix qa-ui run build",
-    "build:qa": "esbuild qa/index.ts --bundle --platform=node --format=esm --packages=external --tsconfig=qa/tsconfig.json --outfile=qa-dist/qa.mjs"
+    "build:qa": "esbuild qa/index.ts --bundle --platform=node --format=esm --packages=external --tsconfig=qa/tsconfig.json --outfile=qa-dist/qa.mjs",
+    "db:init": "node tools/db-init.mjs",
+    "migrate:from-postgres": "node scripts/migrate-from-postgres.mjs",
+    "sweep": "node tools/sweep.mjs server.js && node tools/sweep.mjs qa/qa-module.ts --qa"
   },
   "dependencies": {
     "@capacitor/core": "^8.5.1",

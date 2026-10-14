@@ -24,7 +24,7 @@ if (CLOUDINARY_CONFIGURED) {
 } else {
   console.warn(
     "[uploads] CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET not set — " +
-    "evaluation images will be stored in Postgres instead (max 1MB/image) until Cloudinary is configured."
+    "evaluation images will be stored in the database instead (max 1MB/image) until Cloudinary is configured."
   );
 }
 

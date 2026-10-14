@@ -1,0 +1,5 @@
+[push] VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY not set — web push disabled.
+[push] FIREBASE_SERVICE_ACCOUNT_JSON not set — native Android push disabled.
+[uploads] CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET not set — evaluation images will be stored in the database instead (max 1MB/image) until Cloudinary is configured.
+[xontel] QA_XONTEL_BASE_URL + (QA_XONTEL_TOKEN or QA_XONTEL_USERNAME/QA_XONTEL_PASSWORD) not set — call-recording features are disabled until they are configured.
+[xontel] XONTEL_TOKEN or XONTEL_USERNAME/XONTEL_PASSWORD not set — the XonTel comparison stays hidden until they are.
