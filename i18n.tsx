@@ -103,7 +103,7 @@ const STRINGS: Record<string, { en: string; ar: string }> = {
   'login.authenticating': { en: 'Authenticating...', ar: 'جاري الدخول...' },
   'login.signIn': { en: 'Sign In to Dashboard', ar: 'تسجيل الدخول' },
   'login.invalidCreds': { en: 'Invalid username or password', ar: 'اسم المستخدم أو كلمة المرور غير صحيحة' },
-  'login.disabled': { en: 'This account has been deactivated. Contact your admin.', ar: 'تم إيقاف هذا الحساب. تواصل مع الأدمن.' },
+  'login.disabled': { en: 'There is a problem with your account.', ar: 'يوجد مشكلة في حسابك' },
   'login.connectionError': { en: 'Connection error. Check Firebase status.', ar: 'خطأ في الاتصال. تحقق من حالة الخادم.' },
   'login.rights': { en: 'ALL RIGHTS RESERVED.', ar: 'جميع الحقوق محفوظة.' },
 

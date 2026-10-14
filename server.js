@@ -2157,7 +2157,7 @@ function signToken(user) {
 // request, not only at login, so switching someone off reaches an app they
 // already have open. Every client polls every few seconds, hence the short
 // cache; an admin's change clears it at once (forgetDisabled).
-const ACCOUNT_DISABLED_MSG = 'This account has been deactivated. Contact your admin.';
+const ACCOUNT_DISABLED_MSG = 'There is a problem with your account.';
 const disabledCache = new Map(); // userId -> { at, off }
 const DISABLED_CACHE_MS = 10 * 1000;
 async function isAccountDisabled(userId) {
