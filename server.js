@@ -4934,10 +4934,11 @@ async function xontelProbe() {
   // report's own filter (queuename = the queue number, e.g. 5053 = Shaker New Order).
   const rq = (id, extra = '', sep = ' ') => `/api/v1/explorer/query/execute/${id}?` + new URLSearchParams({ from: `${y}${sep}00:00:00`, to: `${y}${sep}23:59:59`, lang: 'en' }).toString() + extra;
   const paths = [
-    rq(28, '&queuename=5053'),
-    rq(28, '&queuename=5053', 'T'),
-    rq(29),
-    rq(18),
+    rq(28),
+    rq(28, '&queuename='),
+    rq(28, '&queuename=5053&queuename=5065'),
+    rq(18, '&queuename=5053'),
+    rq(18, '&queuename='),
     `/api/v1/xontel_queue/incoming-statistics?from_date=${y}&to_date=${y}&queue=5053`,
   ];
   // The shape matters more than the volume: keys, a count and the head of the body.
