@@ -747,12 +747,20 @@ const xontelUniqueId = (url) => String(url ?? '').match(/-(\d{9,11}\.\d+)\.[A-Za
 
 // Unlike the status feed, the CDR is well behaved: no duplicate rows, proper
 // paging, newest first — so the same early exit applies.
+//
+// The window parameters are start_date / end_date. from_date is accepted but
+// only works as a lower bound with no upper one — a request for 2026-10-17
+// returned everything from then to NOW, newest first — and to_date is
+// ignored, so a "one day" backfill of an old day read 40 pages of other days
+// and never reached anything older than about two weeks (probe, 2026-10-18;
+// the same trap the QA system hit in September). count / total_pages in the
+// reply ignore the window as well, so the end of the data is a short page.
 async function xontelSyncCalls({ fromDate, toDate, full = false }) {
   const now = Date.now();
   let received = 0, stored = 0, pages = 0;
 
   for (let page = 1; page <= XONTEL_MAX_PAGES; page++) {
-    const data = await xontelGet(`/api/v1/cdr/?from_date=${fromDate}&to_date=${toDate}&page=${page}&size=500`);
+    const data = await xontelGet(`/api/v1/cdr/?start_date=${fromDate}&end_date=${toDate}&page=${page}&size=${XONTEL_CDR_PAGE}`);
     const rows = Array.isArray(data) ? data : (data?.results || []);
     pages++;
     received += rows.length;
@@ -813,12 +821,12 @@ async function xontelSyncCalls({ fromDate, toDate, full = false }) {
       stored += changed;
     }
 
-    const totalPages = Number(data?.pages?.total_pages ?? 0);
-    if (totalPages && page >= totalPages) break;
+    if (rows.length < XONTEL_CDR_PAGE) break;                       // a short page is the end of the window
     if (!full && changed === 0) break;
   }
   return { received, stored, pages };
 }
+const XONTEL_CDR_PAGE = 500;
 
 // ---- Missed customer calls ---------------------------------------------------
 // Two feeds, both found by watching XonTel's own Missed Calls page:
@@ -997,7 +1005,9 @@ const XONTEL_FULL_POLL_MS = 15 * 60 * 1000;
 // 2026-09-17 when the link went live. Today and yesterday are covered by the
 // regular full pass, so this stops at the day before yesterday.
 const XONTEL_BACKFILL_FROM = process.env.XONTEL_BACKFILL_FROM || '2026-09-17';
-const XONTEL_BACKFILL_KEY = 'xontel_backfill2';
+// v3: the CDR was read with from_date/to_date until 2026-10-18 (see xontelSyncCalls), so a run recorded
+// under an older key may have called days done that it never really read.
+const XONTEL_BACKFILL_KEY = 'xontel_backfill3';
 const XONTEL_BACKFILL_MAX_TRIES = 6;
 const XONTEL_BACKFILL_RETRY_MS = 30 * 60 * 1000;
 
@@ -4923,6 +4933,12 @@ async function xontelProbe() {
     `/api/v1/xontel_queue/queuelogs?page=1&size=20&from_date=${y}&to_date=${y}`,
     `/api/v1/xontel_queue/queuelogs?page=1&size=20&from_date=${y}&to_date=${y}&event=CONNECT`,
     `/api/v1/xontel_queue/queuelogs?page=1&size=5&start_date=${y}&end_date=${y}`,
+    `/api/v1/xontel_queue/queuelogs?page=1&size=10&from_date=${y}&to_date=${y}&queuename=5053`,
+    `/api/v1/xontel_queue/queuelogs?page=1&size=10&from_date=${y}&to_date=${y}&event=CONNECT&queuename=5053`,
+    `/api/v1/xontel_queue/queuelogs/filters`,
+    `/api/v1/explorer/query/filters/28`,
+    `/api/v1/explorer/query/filters/29`,
+    `/api/v1/explorer/query/filters/18`,
     `/api/v1/xontel_queue/incoming-statistics-filters`,
     `/api/v1/xontel_queue/incoming-statistics?from_date=${y}&to_date=${y}`,
     `/api/v1/xontel_helper/dashboard`,
