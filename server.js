@@ -2907,7 +2907,7 @@ api.post('/schedule/parse', requireRole(...SCHED_MGMT), wrap(async (req, res) =>
   if (BRANCH_MGMT.includes(req.user?.role)) parseRoles.push('BRANCH_EMPLOYEE', 'BRANCH_MANAGER', 'AREA_MANAGER');
   const { rows } = await pool.query(
     `SELECT id, data->>'name' AS name FROM users WHERE data->>'role' = ANY($1)
-       AND ($2 OR COALESCE(data->>'adminOnly', '') <> 'true')`,
+       AND ($2 = true OR COALESCE(data->>'adminOnly', '') <> 'true')`,
     [parseRoles, isAdmin(req)]
   );
   const employees = rows.filter((r) => r.name);
