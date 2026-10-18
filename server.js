@@ -4929,29 +4929,22 @@ async function agentAdherence({ agents, from, to, now = Date.now() }) {
 async function xontelProbe() {
   if (!xontelConfigured()) return;
   const y = addDays(dayKeyInAppTz(Date.now()), -1);
+  // The Reports module runs the same saved queries XonTel's own Reports page runs
+  // (GET, read-only). Params as that page sends them: from, to, lang and the
+  // report's own filter (queuename = the queue number, e.g. 5053 = Shaker New Order).
+  const rq = (id, extra = '', sep = ' ') => `/api/v1/explorer/query/execute/${id}?` + new URLSearchParams({ from: `${y}${sep}00:00:00`, to: `${y}${sep}23:59:59`, lang: 'en' }).toString() + extra;
   const paths = [
-    `/api/v1/xontel_queue/queuelogs?page=1&size=20&from_date=${y}&to_date=${y}`,
-    `/api/v1/xontel_queue/queuelogs?page=1&size=20&from_date=${y}&to_date=${y}&event=CONNECT`,
-    `/api/v1/xontel_queue/queuelogs?page=1&size=5&start_date=${y}&end_date=${y}`,
-    `/api/v1/xontel_queue/queuelogs?page=1&size=10&from_date=${y}&to_date=${y}&queuename=5053`,
-    `/api/v1/xontel_queue/queuelogs?page=1&size=10&from_date=${y}&to_date=${y}&event=CONNECT&queuename=5053`,
-    `/api/v1/xontel_queue/queuelogs/filters`,
-    `/api/v1/explorer/query/filters/28`,
-    `/api/v1/explorer/query/filters/29`,
-    `/api/v1/explorer/query/filters/18`,
-    `/api/v1/xontel_queue/incoming-statistics-filters`,
-    `/api/v1/xontel_queue/incoming-statistics?from_date=${y}&to_date=${y}`,
-    `/api/v1/xontel_helper/dashboard`,
-    `/api/v1/xontel_queue/callactions`,
-    `/api/v1/explorer/queries/`,
-    `/api/v1/cdr/?from_date=${y}&to_date=${y}&page=1&size=3`,
-    `/api/v1/cdr/?start_date=${y}&end_date=${y}&page=1&size=3`,
+    rq(28, '&queuename=5053'),
+    rq(28, '&queuename=5053', 'T'),
+    rq(29),
+    rq(18),
+    `/api/v1/xontel_queue/incoming-statistics?from_date=${y}&to_date=${y}&queue=5053`,
   ];
   // The shape matters more than the volume: keys, a count and the head of the body.
   const compact = (j) => {
     const rows = Array.isArray(j) ? j : j?.results || j?.data;
     const keys = rows && rows[0] && typeof rows[0] === 'object' ? Object.keys(rows[0]) : Object.keys(j || {});
-    return { count: j?.count ?? (Array.isArray(rows) ? rows.length : null), pages: j?.pages ?? null, keys, head: JSON.stringify(j).slice(0, 3500) };
+    return { count: j?.count ?? (Array.isArray(rows) ? rows.length : null), pages: j?.pages ?? null, keys, head: JSON.stringify(j).slice(0, 5000) };
   };
   const out = { at: Date.now(), day: y };
   for (const p of paths) {
