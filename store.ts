@@ -21,6 +21,7 @@ import {
   AdherenceReport,
   KpiTargets,
   MissedReport,
+  ReportConfig,
   SickDocument,
   SickDocsAdminView,
   AttendanceRecord,
@@ -581,6 +582,14 @@ export class Store {
 
   async saveKpiTargets(t: Partial<KpiTargets>): Promise<KpiTargets> {
     return http('PUT', '/agent-kpis/targets', t);
+  }
+
+  async getReportConfig(): Promise<ReportConfig> {
+    return http('GET', '/agent-kpis/report-config');
+  }
+
+  async saveReportConfig(c: Pick<ReportConfig, 'aggregators' | 'queues' | 'statuses'>): Promise<void> {
+    await http('PUT', '/agent-kpis/report-config', c);
   }
 
   async getMissedCalls(from: string, to: string): Promise<MissedReport> {

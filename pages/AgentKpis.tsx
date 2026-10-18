@@ -1,9 +1,9 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import * as XLSX from 'xlsx';
 import { format } from 'date-fns';
-import { Download, Search, X, AlertTriangle, ChevronUp, ChevronDown, SlidersHorizontal, Fingerprint, PhoneMissed } from 'lucide-react';
+import { Download, Search, X, AlertTriangle, ChevronUp, ChevronDown, SlidersHorizontal, Fingerprint, PhoneMissed, ListChecks, Plus, Trash2 } from 'lucide-react';
 import { store } from '../store';
-import { AgentKpiReport, AgentKpiRow, AdherenceReport, AdherenceRow, KpiTargets, MissedReport, MissedCall } from '../types';
+import { AgentKpiReport, AgentKpiRow, AdherenceReport, AdherenceRow, KpiTargets, MissedReport, MissedCall, ReportConfig } from '../types';
 
 // ---------------------------------------------------------------------------
 // Agent performance — call-centre KPIs per agent, from XonTel data.
@@ -238,6 +238,7 @@ export default function AgentKpis() {
   const [missedError, setMissedError] = useState('');
   const [targets, setTargets] = useState<KpiTargets | null>(null);
   const [targetsOpen, setTargetsOpen] = useState(false);
+  const [setupOpen, setSetupOpen] = useState(false);
   const [onlyOutside, setOnlyOutside] = useState(false);
   const today = ymd(new Date());
 
@@ -409,6 +410,10 @@ export default function AgentKpis() {
         <button onClick={() => setTargetsOpen(true)} disabled={!targets}
           className="flex items-center gap-2 px-4 py-3 rounded-2xl bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 text-sm font-bold transition-colors disabled:opacity-40">
           <SlidersHorizontal size={16} /> Targets
+        </button>
+        <button onClick={() => setSetupOpen(true)}
+          className="flex items-center gap-2 px-4 py-3 rounded-2xl bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 text-sm font-bold transition-colors">
+          <ListChecks size={16} /> Reporting setup
         </button>
         <button onClick={exportExcel} disabled={!rows.length}
           className="self-start md:self-auto flex items-center gap-2 px-5 py-3 rounded-2xl bg-gray-900 hover:bg-black text-white text-sm font-bold transition-colors disabled:opacity-40 border border-transparent dark:border-slate-500">
@@ -582,6 +587,8 @@ export default function AgentKpis() {
           </section>
         </div>
       )}
+
+      {setupOpen && <ReportSetupModal onClose={() => setSetupOpen(false)} />}
 
       {targetsOpen && targets && (
         <TargetsModal targets={targets} onClose={() => setTargetsOpen(false)}
@@ -938,6 +945,158 @@ const MissedTab: React.FC<{ report: MissedReport | null; loading: boolean; error
 };
 
 // The targets behind the amber flags, set by a lead; one set for everyone.
+// The lists every call report is classified with: which dial numbers are an
+// aggregator, which queue is which brand and issue, and how each XonTel
+// status counts (available / talk / break / not-ready / offline). Editable by
+// an admin, read-only for leads. "Not in the list yet" shows what the data
+// holds that the lists do not cover, one click from a new row.
+const ReportSetupModal: React.FC<{ onClose: () => void }> = ({ onClose }) => {
+  const [cfg, setCfg] = useState<ReportConfig | null>(null);
+  const [tab, setTab] = useState<'aggregators' | 'queues' | 'statuses'>('aggregators');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const load = () => store.getReportConfig().then((c) => { setCfg(c); setError(''); }).catch(() => setError('Could not load the reporting setup.'));
+  useEffect(() => { load(); }, []);
+  if (!cfg) return (
+    <div className="fixed inset-0 z-[200] flex items-center justify-center p-4 bg-gray-900/60 backdrop-blur-sm" onClick={onClose}>
+      <div className="bg-white rounded-[32px] px-10 py-8 text-sm font-bold text-gray-500" onClick={(e) => e.stopPropagation()}>{error || 'Loading…'}</div>
+    </div>
+  );
+  const edit = cfg.canEdit;
+  const inp = 'w-full px-2.5 py-1.5 rounded-lg bg-gray-50 border border-gray-100 text-sm text-gray-900 outline-none focus:ring-2 focus:ring-blue-500/20 disabled:bg-transparent disabled:border-transparent';
+  const set = (patch: Partial<ReportConfig>) => { setCfg({ ...cfg, ...patch }); setSaved(false); };
+  const upd = <K extends 'aggregators' | 'queues' | 'statuses'>(k: K, i: number, p: Partial<ReportConfig[K][number]>) =>
+    set({ [k]: cfg[k].map((r, j) => (j === i ? { ...r, ...p } : r)) } as Partial<ReportConfig>);
+  const del = (k: 'aggregators' | 'queues' | 'statuses', i: number) => set({ [k]: cfg[k].filter((_, j) => j !== i) } as Partial<ReportConfig>);
+  const add = (k: 'aggregators' | 'queues' | 'statuses', row: any) => set({ [k]: [...cfg[k], row] } as Partial<ReportConfig>);
+  const save = async () => {
+    setBusy(true); setError('');
+    try {
+      await store.saveReportConfig({ aggregators: cfg.aggregators, queues: cfg.queues, statuses: cfg.statuses });
+      await load(); setSaved(true);
+    } catch (e: any) {
+      const m = String(e?.message || '').match(/\{.*\}/s);
+      let msg = 'Could not save.';
+      try { msg = (m && JSON.parse(m[0])?.error) || msg; } catch { /* keep default */ }
+      setError(msg);
+    }
+    setBusy(false);
+  };
+  const tabs: { k: typeof tab; label: string; n: number }[] = [
+    { k: 'aggregators', label: 'Aggregator numbers', n: cfg.aggregators.length },
+    { k: 'queues', label: 'Queues → brand', n: cfg.queues.length },
+    { k: 'statuses', label: 'Status classes', n: cfg.statuses.length },
+  ];
+  const chip = (label: string, onClick: () => void) => edit ? (
+    <button key={label} onClick={onClick} className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-50 border border-amber-200 text-amber-800 text-xs font-bold hover:bg-amber-100">
+      <Plus size={12} /> {label}
+    </button>
+  ) : <span key={label} className="px-2.5 py-1 rounded-lg bg-amber-50 border border-amber-200 text-amber-800 text-xs font-bold">{label}</span>;
+  const head = (cols: string[]) => (
+    <thead className="border-y border-gray-100 bg-gray-50/50"><tr>
+      {cols.map((c) => <th key={c} className="px-3 py-2.5 text-left text-xs font-bold text-gray-500">{c}</th>)}
+      {edit && <th className="w-10" />}
+    </tr></thead>
+  );
+  const delBtn = (k: 'aggregators' | 'queues' | 'statuses', i: number) => edit && (
+    <td className="px-2"><button onClick={() => del(k, i)} aria-label="Remove" className="p-1.5 rounded-lg text-gray-400 hover:text-rose-600 hover:bg-rose-50"><Trash2 size={14} /></button></td>
+  );
+  const unm = cfg.unmapped;
+  return (
+    <div className="fixed inset-0 z-[200] flex items-center justify-center p-4 bg-gray-900/60 backdrop-blur-sm" onClick={() => !busy && onClose()}>
+      <div className="bg-white rounded-[32px] w-full max-w-4xl max-h-[90vh] flex flex-col shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="px-7 pt-7 pb-4 flex items-start justify-between gap-4 shrink-0">
+          <div>
+            <h2 className="text-xl font-black text-gray-900 tracking-tight">Reporting setup</h2>
+            <p className="text-xs text-gray-400 mt-1 max-w-xl">How calls and statuses are classified in the reports. Brand, issue and aggregator are looked up from these lists when a report runs, so an edit applies to past days too.{edit ? '' : ' Only an admin can edit them.'}</p>
+          </div>
+          <button onClick={() => !busy && onClose()} className="w-10 h-10 rounded-2xl flex items-center justify-center bg-gray-50 text-gray-500 hover:bg-gray-100 shrink-0"><X size={16} /></button>
+        </div>
+        <div className="px-7 shrink-0">
+          <div className="inline-flex p-1 bg-gray-100 rounded-2xl">
+            {tabs.map((t) => (
+              <button key={t.k} onClick={() => setTab(t.k)} className={`px-4 py-2 rounded-xl text-sm font-bold transition-colors ${tab === t.k ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-800'}`}>
+                {t.label} <span className="text-gray-400 font-semibold">{t.n}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="px-7 py-4 overflow-y-auto grow min-h-0">
+          {tab === 'aggregators' && (
+            <>
+              <p className="text-xs text-gray-500 mb-3">A call from one of these numbers counts as that aggregator; every other caller is a customer. "ivr" marks an IVR line.</p>
+              {unm.callers.length > 0 && (
+                <div className="mb-4"><p className="text-xs font-bold text-gray-700 mb-1.5">Not in the list yet — these rang 20+ times in 30 days</p>
+                  <div className="flex flex-wrap gap-2">{unm.callers.map((c) => chip(`${c.number} · ${c.calls} calls`, () => add('aggregators', { number: c.number, aggregator: '', kind: 'caller', note: '' })))}</div></div>
+              )}
+              <table className="w-full text-sm">{head(['Number', 'Aggregator', 'Kind', 'Note'])}<tbody className="divide-y divide-gray-50">
+                {cfg.aggregators.map((r, i) => (
+                  <tr key={i}>
+                    <td className="px-3 py-1.5 w-40"><input className={inp} disabled={!edit} value={r.number} onChange={(e) => upd('aggregators', i, { number: e.target.value })} /></td>
+                    <td className="px-3 py-1.5"><input className={inp} disabled={!edit} value={r.aggregator} onChange={(e) => upd('aggregators', i, { aggregator: e.target.value })} /></td>
+                    <td className="px-3 py-1.5 w-32"><select className={inp} disabled={!edit} value={r.kind} onChange={(e) => upd('aggregators', i, { kind: e.target.value })}>{cfg.kinds.map((k) => <option key={k}>{k}</option>)}</select></td>
+                    <td className="px-3 py-1.5"><input className={inp} disabled={!edit} value={r.note || ''} onChange={(e) => upd('aggregators', i, { note: e.target.value })} /></td>
+                    {delBtn('aggregators', i)}
+                  </tr>
+                ))}
+              </tbody></table>
+              {edit && <button onClick={() => add('aggregators', { number: '', aggregator: '', kind: 'caller', note: '' })} className="mt-3 inline-flex items-center gap-1.5 text-sm font-bold text-blue-600 hover:text-blue-800"><Plus size={14} /> Add a number</button>}
+            </>
+          )}
+          {tab === 'queues' && (
+            <>
+              <p className="text-xs text-gray-500 mb-3">Each XonTel queue belongs to one brand and one issue type (New Order, Follow Up, Complaints…).</p>
+              {unm.queues.length > 0 && (
+                <div className="mb-4"><p className="text-xs font-bold text-gray-700 mb-1.5">Not in the list yet — seen in the last 30 days</p>
+                  <div className="flex flex-wrap gap-2">{unm.queues.map((q) => chip(`${q.queue} · ${q.calls} calls`, () => add('queues', { queue: q.queue, brand: '', issue: '', note: '' })))}</div></div>
+              )}
+              <table className="w-full text-sm">{head(['Queue (as XonTel names it)', 'Brand', 'Issue'])}<tbody className="divide-y divide-gray-50">
+                {cfg.queues.map((r, i) => (
+                  <tr key={i}>
+                    <td className="px-3 py-1.5"><input className={inp} disabled={!edit} value={r.queue} onChange={(e) => upd('queues', i, { queue: e.target.value })} /></td>
+                    <td className="px-3 py-1.5"><input className={inp} disabled={!edit} value={r.brand} onChange={(e) => upd('queues', i, { brand: e.target.value })} /></td>
+                    <td className="px-3 py-1.5"><input className={inp} disabled={!edit} value={r.issue} onChange={(e) => upd('queues', i, { issue: e.target.value })} /></td>
+                    {delBtn('queues', i)}
+                  </tr>
+                ))}
+              </tbody></table>
+              {edit && <button onClick={() => add('queues', { queue: '', brand: '', issue: '', note: '' })} className="mt-3 inline-flex items-center gap-1.5 text-sm font-bold text-blue-600 hover:text-blue-800"><Plus size={14} /> Add a queue</button>}
+            </>
+          )}
+          {tab === 'statuses' && (
+            <>
+              <p className="text-xs text-gray-500 mb-3">Not Ready (NR) is every signed-in status that is neither Ready nor a call. A <b>break</b> is the part of it that is Break, Toilet, Pray or Eating, so total NR = nr + break.</p>
+              {unm.statuses.length > 0 && (
+                <div className="mb-4"><p className="text-xs font-bold text-gray-700 mb-1.5">Not in the list yet — agents used these in the last 30 days</p>
+                  <div className="flex flex-wrap gap-2">{unm.statuses.map((x) => chip(`${x.status} · ${x.hours}h`, () => add('statuses', { status: x.status, class: 'nr' })))}</div></div>
+              )}
+              <table className="w-full text-sm">{head(['XonTel status', 'Counts as'])}<tbody className="divide-y divide-gray-50">
+                {cfg.statuses.map((r, i) => (
+                  <tr key={i}>
+                    <td className="px-3 py-1.5"><input className={inp} disabled={!edit} value={r.status} onChange={(e) => upd('statuses', i, { status: e.target.value })} /></td>
+                    <td className="px-3 py-1.5 w-48"><select className={inp} disabled={!edit} value={r.class} onChange={(e) => upd('statuses', i, { class: e.target.value })}>{cfg.classes.map((k) => <option key={k}>{k}</option>)}</select></td>
+                    {delBtn('statuses', i)}
+                  </tr>
+                ))}
+              </tbody></table>
+              {edit && <button onClick={() => add('statuses', { status: '', class: 'nr' })} className="mt-3 inline-flex items-center gap-1.5 text-sm font-bold text-blue-600 hover:text-blue-800"><Plus size={14} /> Add a status</button>}
+            </>
+          )}
+        </div>
+        {edit && (
+          <div className="px-7 py-4 border-t border-gray-100 flex items-center justify-end gap-4 shrink-0">
+            {error && <p className="text-xs font-bold text-rose-600 mr-auto">{error}</p>}
+            {saved && !error && <p className="text-xs font-bold text-emerald-600 mr-auto">Saved.</p>}
+            <button onClick={save} disabled={busy} className="px-8 py-3 rounded-2xl bg-gray-900 hover:bg-black text-white font-bold text-sm transition-colors disabled:opacity-50">{busy ? 'Saving…' : 'Save setup'}</button>
+          </div>
+        )}
+        {!edit && error && <p className="px-7 pb-4 text-xs font-bold text-rose-600">{error}</p>}
+      </div>
+    </div>
+  );
+};
+
 const TargetsModal: React.FC<{ targets: KpiTargets; onClose: () => void; onSave: (t: Partial<KpiTargets>) => Promise<void> }> = ({ targets, onClose, onSave }) => {
   const [aht, setAht] = useState(mmss(targets.ahtMaxSec));
   const [brk, setBrk] = useState(String(Math.round(targets.breakMaxSecPerDay / 60)));

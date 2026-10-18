@@ -741,6 +741,10 @@ const xontelCdrTs = (v) => {
   return Number.isFinite(t) ? t : null;
 };
 
+// The Asterisk uniqueid, which XonTel writes at the end of every recording's
+// filename: .../q-5053-99727263-20261018-192656-1792340816.105527.wav
+const xontelUniqueId = (url) => String(url ?? '').match(/-(\d{9,11}\.\d+)\.[A-Za-z0-9]+$/)?.[1] ?? null;
+
 // Unlike the status feed, the CDR is well behaved: no duplicate rows, proper
 // paging, newest first — so the same early exit applies.
 async function xontelSyncCalls({ fromDate, toDate, full = false }) {
@@ -762,7 +766,11 @@ async function xontelSyncCalls({ fromDate, toDate, full = false }) {
       const dur = xontelDurationSec(r.duration) ?? 0;
       // billsec is the answered portion; a missed call has none.
       const talk = Number.isFinite(Number(r.billsec)) ? Math.max(0, Math.round(Number(r.billsec))) : 0;
+      const rec = r.record_file_url ?? null;
       out.push({
+        uniqueid: xontelUniqueId(rec) ?? (r.uniqueid ? String(r.uniqueid) : null),
+        did: r.did ?? r.dnid ?? r.did_number ?? null,
+        raw: r,
         id: String(id),
         agentId: r.agent_id === null || r.agent_id === undefined ? null : String(r.agent_id),
         agentName: r.agent ?? null,
@@ -771,7 +779,7 @@ async function xontelSyncCalls({ fromDate, toDate, full = false }) {
         status: r.call_status?.value ?? r.call_status ?? null,
         number: r.caller_number ?? r.src ?? null,
         queue: r.dst ?? null,
-        rec: r.record_file_url ?? null,
+        rec,
       });
     }
 
@@ -779,21 +787,27 @@ async function xontelSyncCalls({ fromDate, toDate, full = false }) {
     if (out.length) {
       const { rows: res } = await pool.query(
         `INSERT INTO xontel_calls (id, xontel_agent_id, agent_name, start_ts, duration_sec, talk_sec,
-                                   direction, status, caller_number, queue, recording_url, fetched_at)
+                                   direction, status, caller_number, queue, recording_url, fetched_at,
+                                   uniqueid, did, raw)
          SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::bigint[], $5::int[], $6::int[],
-                              $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::bigint[])
+                              $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::bigint[],
+                              $13::text[], $14::text[], $15::jsonb[])
          ON CONFLICT (id) DO UPDATE SET
            xontel_agent_id = EXCLUDED.xontel_agent_id, agent_name = EXCLUDED.agent_name,
            start_ts = EXCLUDED.start_ts, duration_sec = EXCLUDED.duration_sec, talk_sec = EXCLUDED.talk_sec,
            direction = EXCLUDED.direction, status = EXCLUDED.status, caller_number = EXCLUDED.caller_number,
-           queue = EXCLUDED.queue, recording_url = EXCLUDED.recording_url, fetched_at = EXCLUDED.fetched_at
+           queue = EXCLUDED.queue, recording_url = EXCLUDED.recording_url, fetched_at = EXCLUDED.fetched_at,
+           uniqueid = EXCLUDED.uniqueid, did = EXCLUDED.did, raw = EXCLUDED.raw
          WHERE xontel_calls.start_ts IS DISTINCT FROM EXCLUDED.start_ts
             OR xontel_calls.talk_sec IS DISTINCT FROM EXCLUDED.talk_sec
             OR xontel_calls.status IS DISTINCT FROM EXCLUDED.status
+            OR xontel_calls.raw IS NULL
          RETURNING id`,
         [out.map((o) => o.id), out.map((o) => o.agentId), out.map((o) => o.agentName), out.map((o) => o.start),
          out.map((o) => o.dur), out.map((o) => o.talk), out.map((o) => o.direction), out.map((o) => o.status),
-         out.map((o) => o.number), out.map((o) => o.queue), out.map((o) => o.rec), out.map(() => now)]
+         out.map((o) => o.number), out.map((o) => o.queue), out.map((o) => o.rec), out.map(() => now),
+         out.map((o) => o.uniqueid), out.map((o) => o.did === null || o.did === undefined ? null : String(o.did)),
+         out.map((o) => J(o.raw))]
       );
       changed = res.length;
       stored += changed;
@@ -983,35 +997,72 @@ const XONTEL_FULL_POLL_MS = 15 * 60 * 1000;
 // 2026-09-17 when the link went live. Today and yesterday are covered by the
 // regular full pass, so this stops at the day before yesterday.
 const XONTEL_BACKFILL_FROM = process.env.XONTEL_BACKFILL_FROM || '2026-09-17';
+const XONTEL_BACKFILL_KEY = 'xontel_backfill2';
+const XONTEL_BACKFILL_MAX_TRIES = 6;
+const XONTEL_BACKFILL_RETRY_MS = 30 * 60 * 1000;
+
+// What the backfill still owes: the days after the last one it reached, plus
+// every (day, part) that failed last time and has tries left. A day counts as
+// done only when both its status sessions and its calls were read. An
+// earlier version wrote "done" after a run in which every day had failed
+// (XonTel unreachable), and the days 2026-10-05..09 were never filled.
+function xontelBackfillWork(marker, from, to) {
+  const work = new Map();
+  const add = (d, p) => { if (!work.has(d)) work.set(d, new Set()); work.get(d).add(p); };
+  for (const f of Array.isArray(marker?.failed) ? marker.failed : []) {
+    if ((f.tries || 0) < XONTEL_BACKFILL_MAX_TRIES && f.day >= from && f.day <= to) add(f.day, f.part);
+  }
+  const next = marker?.through && marker.through >= from ? addDays(marker.through, 1) : from;
+  for (let d = next; d <= to; d = addDays(d, 1)) { add(d, 'sessions'); add(d, 'calls'); }
+  return new Map([...work.entries()].sort((a, b) => a[0].localeCompare(b[0])));
+}
+
 async function xontelBackfillOnce() {
   if (!xontelConfigured()) return;
-  const marker = (await pool.query(`SELECT detail FROM sync_state WHERE id = 'xontel_backfill'`)).rows[0]?.detail;
+  const marker = (await pool.query(`SELECT detail FROM sync_state WHERE id = $1`, [XONTEL_BACKFILL_KEY])).rows[0]?.detail;
   const to = addDays(dayKeyInAppTz(Date.now()), -2);
-  if (marker?.done && marker?.through >= to) return;              // already covered
   const from = XONTEL_BACKFILL_FROM;
   if (to < from) return;
-  console.log(`[xontel] backfill starting: ${from}..${to}`);
+  const work = xontelBackfillWork(marker, from, to);
+  if (!work.size) return;                                          // already covered
+  console.log(`[xontel] backfill starting: ${work.size} day(s) of ${from}..${to}`);
+  const prevTries = new Map((marker?.failed || []).map((f) => [`${f.day}|${f.part}`, f.tries || 0]));
+  // Failures that are out of tries stay in the marker so they remain visible.
+  const failed = (marker?.failed || []).filter((f) => (f.tries || 0) >= XONTEL_BACKFILL_MAX_TRIES);
+  const empty = (marker?.empty || []).filter((d) => !work.has(d));
   let days = 0, sessions = 0, calls = 0;
-  for (let d = from; d <= to; d = addDays(d, 1)) {
+  for (const [d, parts] of work) {
     while (xontelBusy) await new Promise((r) => setTimeout(r, 2000));
     xontelBusy = true;
     try {
-      const s = await xontelSync({ fromDate: d, toDate: d, full: true });
-      const c = await xontelSyncCalls({ fromDate: d, toDate: d, full: true });
-      sessions += s.stored; calls += c.stored; days++;
-    } catch (e) {
-      console.error(`[xontel] backfill ${d} failed:`, e.message);
+      for (const part of ['sessions', 'calls']) {
+        if (!parts.has(part)) continue;
+        try {
+          if (part === 'sessions') sessions += (await xontelSync({ fromDate: d, toDate: d, full: true })).stored;
+          else {
+            const c = await xontelSyncCalls({ fromDate: d, toDate: d, full: true });
+            calls += c.stored;
+            if (c.received === 0) empty.push(d);
+          }
+        } catch (e) {
+          console.error(`[xontel] backfill ${d} ${part} failed:`, e.message);
+          failed.push({ day: d, part, tries: (prevTries.get(`${d}|${part}`) || 0) + 1, error: String(e.message).slice(0, 120) });
+        }
+      }
+      days++;
     } finally {
       xontelBusy = false;
     }
     await new Promise((r) => setTimeout(r, 2000));
   }
+  const retriable = failed.filter((f) => f.tries < XONTEL_BACKFILL_MAX_TRIES);
   await pool.query(
-    `INSERT INTO sync_state (id, last_sync_at, detail) VALUES ('xontel_backfill', $1, $2::jsonb)
+    `INSERT INTO sync_state (id, last_sync_at, detail) VALUES ($1, $2, $3::jsonb)
      ON CONFLICT (id) DO UPDATE SET last_sync_at = EXCLUDED.last_sync_at, detail = EXCLUDED.detail`,
-    [Date.now(), J({ done: true, from, through: to, days, sessions, calls, at: Date.now() })]
+    [XONTEL_BACKFILL_KEY, Date.now(), J({ done: !failed.length, from, through: to, failed, empty: [...new Set(empty)].sort(), days, sessions, calls, at: Date.now() })]
   );
-  console.log(`[xontel] backfill done: ${days} day(s), ${sessions} session(s), ${calls} call(s) healed`);
+  console.log(`[xontel] backfill finished: ${days} day(s) visited, ${sessions} session(s), ${calls} call(s) healed, ${failed.length} failed part(s)`);
+  if (retriable.length) setTimeout(() => xontelBackfillOnce().catch((e) => console.error('[xontel] backfill retry failed:', e.message)), XONTEL_BACKFILL_RETRY_MS);
 }
 
 // The call-back log is small (a few thousand rows in all), so its whole
@@ -1445,12 +1496,78 @@ const REQUIRED_OBJECTS = [
 ];
 const QA_OBJECTS = ['qa_user_profile', 'qa_users', 'qa_evaluations', 'qa_attendance_records'];
 
+// ---- Reporting setup seeds (Ops email, Oct 2026) -----------------------------
+// Inserted once, only into an empty table, so an admin's later edits (and
+// deletions) are never put back by a restart.
+const REPORT_AGGREGATORS = [
+  ['Talabat', '22245002'], ['Deliveroo', '22270143'], ['Cari', '22204362'], ['Jahez', '22254898'], ['V-Thru', '22063499'],
+  ['Talabat', '1800200'], ['Jahez', '1878788'], ['Cari', '22255240'], ['Talabat', '22245001'], ['Keeta', '22086650'],
+  ['Keeta', '22393603'], ['Keeta', '22393604'], ['Deliveroo', '22270142'], ['Deliveroo', '22202592'], ['Keeta', '22086646'],
+  ['IVR', '22086647'], ['Keeta', '22086651'], ['IVR', '22252187'], ['Keeta', '22393601'], ['Keeta', '22393602'],
+  ['Keeta', '22393605'], ['Keeta', '22393606'], ['IVR', '22393616'], ['IVR', '22393617'], ['Talabat', '22015058'], ['Keeta', '25211230'],
+];
+const REPORT_QUEUES = [
+  ['BBT Follow Up', 'BBT', 'Follow Up'], ['BBT New Order', 'BBT', 'New Order'], ['BBT Complaints', 'BBT', 'Complaints'],
+  ['Chili Pepper Follow Up', 'Chili Pepper', 'Follow Up'], ['Chili Pepper New Order', 'Chili Pepper', 'New Order'], ['Chili Pepper Complaints', 'Chili Pepper', 'Complaints'],
+  ['Forever More Queue', 'Forever More Queue', 'Forever More Queue'],
+  ['Just C New Order', 'Just C', 'New Order'], ['Just C Follow Up', 'Just C', 'Follow Up'], ['Just C Complaints', 'Just C', 'Complaints'],
+  ['Mishmash New Order', 'Mishmash', 'New Order'], ['Mishmash Catering', 'Mishmash', 'Catering'], ['Mishmash Follow Up', 'Mishmash', 'Follow Up'], ['Mishmash Complain', 'Mishmash', 'Complaints'],
+  ['Pattie Pattie Queue', 'Pattie Pattie', 'Pattie Pattie Queue'],
+  ['Shaker New Order', 'Shakir', 'New Order'], ['Shakir Follow Up', 'Shakir', 'Follow Up'], ['Shakir Complaints', 'Shakir', 'Complaints'],
+  ['Slice Complains', 'Slice', 'Complaints'], ['Slice Follow up', 'Slice', 'Follow Up'], ['Slice New Order', 'Slice', 'New Order'],
+  ['Tabel Follow Up', 'Tabel', 'Follow Up'], ['Tabel Complain', 'Tabel', 'Complaints'], ['Tabel Catering', 'Tabel', 'Catering'],
+  ['Unknown Queue', 'Unknown Queue', 'Unknown Queue'],
+  ['Yelo Pizza New Order', 'Yelo Pizza', 'New Order'], ['Yelo Pizza Follow Up', 'Yelo Pizza', 'Follow Up'], ['Yelo Pizza Complaint', 'Yelo Pizza', 'Complaints'],
+  ['BBT Redtown Queue', 'BBT', 'Redtown Queue'], ['Tabel New Order', 'Tabel', 'New Order'],
+];
+// Not Ready is everything a signed-in agent is doing that is neither Ready
+// nor a call; Break (Break, Toilet, Pray, Eating) is the part of it that is
+// a break, so NR total = nr + break.
+const REPORT_STATUS_CLASSES = [
+  ['ready', 'available'], ['in call', 'talk'], ['offline', 'offline'],
+  ['Break', 'break'], ['Toilet', 'break'], ['Pray', 'break'], ['Eating', 'break'],
+  ['Complain', 'nr'], ['Coaching', 'nr'], ['Reportings', 'nr'], ['Punching', 'nr'], ['Survey', 'nr'], ['Reviews', 'nr'], ['Pause', 'nr'],
+];
+const REPORT_NUMBER_KINDS = ['caller', 'dialed', 'ivr'];
+const REPORT_STATUS_CLASS_NAMES = ['available', 'talk', 'break', 'nr', 'offline'];
+
+// Digits only, no 00 prefix, and no 965 country code from a number longer
+// than a Kuwait 8-digit one (a plain 8-digit mobile can start with 965).
+const normReportNumber = (v) => {
+  const d = String(v ?? '').replace(/[^0-9]/g, '').replace(/^00/, '');
+  return d.length > 8 && d.startsWith('965') ? d.slice(3) : d;
+};
+
+async function seedReportConfig() {
+  const now = Date.now();
+  const empty = async (t) => (await pool.query(`SELECT 1 FROM ${t} LIMIT 1`)).rows.length === 0;
+  if (await empty('xontel_aggregator_numbers')) {
+    for (const [name, num] of REPORT_AGGREGATORS) {
+      await pool.query(
+        `INSERT INTO xontel_aggregator_numbers (number, aggregator, kind, updated_by, updated_at) VALUES ($1, $2, $3, 'seed', $4) ON CONFLICT DO NOTHING`,
+        [normReportNumber(num), name, name === 'IVR' ? 'ivr' : 'caller', now]
+      );
+    }
+  }
+  if (await empty('xontel_queue_map')) {
+    for (const [queue, brand, issue] of REPORT_QUEUES) {
+      await pool.query(`INSERT INTO xontel_queue_map (queue, brand, issue, updated_by, updated_at) VALUES ($1, $2, $3, 'seed', $4) ON CONFLICT DO NOTHING`, [queue, brand, issue, now]);
+    }
+  }
+  if (await empty('xontel_status_class')) {
+    for (const [status, cls] of REPORT_STATUS_CLASSES) {
+      await pool.query(`INSERT INTO xontel_status_class (status, class, updated_by, updated_at) VALUES ($1, $2, 'seed', $3) ON CONFLICT DO NOTHING`, [status, cls, now]);
+    }
+  }
+}
+
 async function initDb() {
   if (process.env.AUTO_INIT_DB === 'true') {
     const n = await initDatabase({ createDatabase: true });
     console.log(`[db] schema applied (${n} batches)`);
   }
   await verifySchema(process.env.QA_MODULE === 'off' ? REQUIRED_OBJECTS : [...REQUIRED_OBJECTS, ...QA_OBJECTS]);
+  await seedReportConfig();
   console.log('[db] schema ready');
 }
 
@@ -4284,6 +4401,131 @@ api.put('/agent-kpis/targets', requireRole(...KPI_ROLES), wrap(async (req, res) 
   res.json(await kpiTargets());
 }));
 
+// ---- Reporting setup: the lists calls and statuses are classified with -------
+// Aggregator dial numbers, queue -> brand / issue, and status -> class
+// (available / talk / break / nr / offline). Managers read them, an admin
+// edits them; the Unmapped lists show what the data holds that the lists
+// don't cover yet, so Ops can add it without a deploy.
+api.get('/agent-kpis/report-config', requireRole(...KPI_ROLES), wrap(async (req, res) => {
+  const since = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const [agg, qm, sc, uq, uc, us] = await Promise.all([
+    pool.query('SELECT number, aggregator, kind, note FROM xontel_aggregator_numbers ORDER BY aggregator, number'),
+    pool.query('SELECT queue, brand, issue, note FROM xontel_queue_map ORDER BY brand, issue, queue'),
+    pool.query('SELECT status, class FROM xontel_status_class ORDER BY class, status'),
+    pool.query(
+      `SELECT c.queue, count(DISTINCT coalesce(c.uniqueid, c.id))::int AS calls
+         FROM xontel_calls c
+        WHERE c.start_ts >= $1 AND c.direction = 'Incoming' AND c.queue ~ '[A-Za-z]'
+          AND NOT EXISTS (SELECT 1 FROM xontel_queue_map m WHERE lower(m.queue) = lower(c.queue))
+        GROUP BY 1 ORDER BY 2 DESC LIMIT 30`, [since]
+    ),
+    // Callers that look like a company line (a 7-8 digit landline) and ring
+    // often but are not in the aggregator list.
+    pool.query(
+      `SELECT n AS number, count(DISTINCT cid)::int AS calls FROM (
+          SELECT coalesce(c.uniqueid, c.id) AS cid,
+                 CASE WHEN length(d) > 8 AND d LIKE '965%' THEN substr(d, 4) ELSE d END AS n
+            FROM xontel_calls c, LATERAL (SELECT regexp_replace(regexp_replace(coalesce(c.caller_number, ''), '[^0-9]', '', 'g'), '^00', '') AS d) x
+           WHERE c.start_ts >= $1 AND c.direction = 'Incoming'
+        ) t
+        WHERE n ~ '^(2[0-9]{7}|1[0-9]{6})$'
+          AND NOT EXISTS (SELECT 1 FROM xontel_aggregator_numbers a WHERE a.number = t.n)
+        GROUP BY 1 HAVING count(DISTINCT cid) >= 20 ORDER BY 2 DESC LIMIT 15`, [since]
+    ),
+    pool.query(
+      `SELECT s.status, round(sum(coalesce(s.duration_sec, 0)) / 3600.0)::int AS hours
+         FROM xontel_sessions s
+        WHERE s.start_ts >= $1 AND NOT EXISTS (SELECT 1 FROM xontel_status_class k WHERE lower(k.status) = lower(s.status))
+        GROUP BY 1 ORDER BY 2 DESC LIMIT 20`, [since]
+    ),
+  ]);
+  res.json({
+    canEdit: isAdmin(req),
+    aggregators: agg.rows, queues: qm.rows, statuses: sc.rows,
+    unmapped: { queues: uq.rows, callers: uc.rows, statuses: us.rows },
+    classes: REPORT_STATUS_CLASS_NAMES, kinds: REPORT_NUMBER_KINDS,
+  });
+}));
+
+api.put('/agent-kpis/report-config', requireRole('ADMIN'), wrap(async (req, res) => {
+  const b = req.body || {};
+  const str = (v, max = 80) => String(v ?? '').trim().slice(0, max);
+  const fail = (m) => res.status(400).json({ error: m });
+  const plan = {};
+  if (b.aggregators !== undefined) {
+    if (!Array.isArray(b.aggregators)) return fail('aggregators must be a list.');
+    const seen = new Set(), rows = [];
+    for (const r of b.aggregators) {
+      const number = normReportNumber(r?.number), aggregator = str(r?.aggregator, 40), kind = str(r?.kind || 'caller', 10);
+      if (!/^[0-9]{3,15}$/.test(number)) return fail(`"${str(r?.number, 20)}" is not a valid number.`);
+      if (!aggregator) return fail(`Number ${number} needs an aggregator name.`);
+      if (!REPORT_NUMBER_KINDS.includes(kind)) return fail(`Kind must be one of ${REPORT_NUMBER_KINDS.join(', ')}.`);
+      if (seen.has(number)) return fail(`Number ${number} is listed twice.`);
+      seen.add(number); rows.push({ number, aggregator, kind, note: str(r?.note, 120) || null });
+    }
+    plan.aggregators = rows;
+  }
+  if (b.queues !== undefined) {
+    if (!Array.isArray(b.queues)) return fail('queues must be a list.');
+    const seen = new Set(), rows = [];
+    for (const r of b.queues) {
+      const queue = str(r?.queue, 80), brand = str(r?.brand, 60), issue = str(r?.issue, 60);
+      if (!queue || !brand || !issue) return fail('Every queue needs a name, a brand and an issue.');
+      if (seen.has(queue.toLowerCase())) return fail(`Queue "${queue}" is listed twice.`);
+      seen.add(queue.toLowerCase()); rows.push({ queue, brand, issue, note: str(r?.note, 120) || null });
+    }
+    plan.queues = rows;
+  }
+  if (b.statuses !== undefined) {
+    if (!Array.isArray(b.statuses)) return fail('statuses must be a list.');
+    const seen = new Set(), rows = [];
+    for (const r of b.statuses) {
+      const status = str(r?.status, 40), cls = str(r?.class, 12);
+      if (!status) return fail('Every status needs a name.');
+      if (!REPORT_STATUS_CLASS_NAMES.includes(cls)) return fail(`Class must be one of ${REPORT_STATUS_CLASS_NAMES.join(', ')}.`);
+      if (seen.has(status.toLowerCase())) return fail(`Status "${status}" is listed twice.`);
+      seen.add(status.toLowerCase()); rows.push({ status, class: cls });
+    }
+    plan.statuses = rows;
+  }
+  const now = Date.now(), by = req.user.id;
+  const client = await pool.connect();
+  const counts = [];
+  try {
+    await client.query('BEGIN');
+    if (plan.aggregators) {
+      await client.query('DELETE FROM xontel_aggregator_numbers');
+      for (const r of plan.aggregators) await client.query(
+        'INSERT INTO xontel_aggregator_numbers (number, aggregator, kind, note, updated_by, updated_at) VALUES ($1, $2, $3, $4, $5, $6)',
+        [r.number, r.aggregator, r.kind, r.note, by, now]);
+      counts.push(`${plan.aggregators.length} aggregator numbers`);
+    }
+    if (plan.queues) {
+      await client.query('DELETE FROM xontel_queue_map');
+      for (const r of plan.queues) await client.query(
+        'INSERT INTO xontel_queue_map (queue, brand, issue, note, updated_by, updated_at) VALUES ($1, $2, $3, $4, $5, $6)',
+        [r.queue, r.brand, r.issue, r.note, by, now]);
+      counts.push(`${plan.queues.length} queues`);
+    }
+    if (plan.statuses) {
+      await client.query('DELETE FROM xontel_status_class');
+      for (const r of plan.statuses) await client.query(
+        'INSERT INTO xontel_status_class (status, class, updated_by, updated_at) VALUES ($1, $2, $3, $4)', [r.status, r.class, by, now]);
+      counts.push(`${plan.statuses.length} statuses`);
+    }
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+  if (counts.length) {
+    await logAudit(req, { action: 'kpi.report-config', entityType: 'kpi_report_config', entityId: 'global', summary: `${req.user.name} saved the reporting setup: ${counts.join(', ')}` });
+  }
+  res.json({ ok: true });
+}));
+
 // Shift adherence rows for the viewer's agents (see agentAdherence).
 api.get('/agent-kpis/adherence', requireRole(...KPI_ROLES), wrap(async (req, res) => {
   const range = kpiRange(req, res);
@@ -4671,36 +4913,31 @@ async function agentAdherence({ agents, from, to, now = Date.now() }) {
 
 // Read-only discovery: fetch a few XonTel endpoints whose response shape is
 // unknown and keep a trimmed copy of each in sync_state ('xontel_probe').
+// Today's question (Ops reporting email): can the queue log, the queue
+// statistics or the Reports module give a per-call CONNECT time (wait and
+// ringing), and does the CDR take from_date or start_date? GET only.
 async function xontelProbe() {
   if (!xontelConfigured()) return;
-  const today = dayKeyInAppTz(Date.now());
-  // Per-agent days where the stored feed shows a one-minute session and then
-  // nothing — asked for directly (user=) so paging can't hide anything.
-  // Walaa 09-30 is the control: fully covered in the store.
+  const y = addDays(dayKeyInAppTz(Date.now()), -1);
   const paths = [
-    '/api/v1/account/agentstatus?user=20&from_date=2026-09-30&to_date=2026-09-30&page=1&size=300',
-    '/api/v1/account/agentstatus?user=62&from_date=2026-09-29&to_date=2026-09-29&page=1&size=300',
-    '/api/v1/account/agentstatus?user=71&from_date=2026-09-30&to_date=2026-09-30&page=1&size=300',
-    '/api/v1/account/agentstatus?user=75&from_date=2026-09-30&to_date=2026-09-30&page=1&size=300',
-    '/api/v1/account/user-status/?user=20',
-    '/api/v1/account/agentstatus?page=1&size=40',
-    '/api/v1/xontel_helper/missed_calls_dashboard?page=1&page_size=100',
-    '/api/v1/xontel_queue/missedcallhistory?page=1&size=100&from_date=2026-09-24&to_date=2026-10-01',
+    `/api/v1/xontel_queue/queuelogs?page=1&size=20&from_date=${y}&to_date=${y}`,
+    `/api/v1/xontel_queue/queuelogs?page=1&size=20&from_date=${y}&to_date=${y}&event=CONNECT`,
+    `/api/v1/xontel_queue/queuelogs?page=1&size=5&start_date=${y}&end_date=${y}`,
+    `/api/v1/xontel_queue/incoming-statistics-filters`,
+    `/api/v1/xontel_queue/incoming-statistics?from_date=${y}&to_date=${y}`,
+    `/api/v1/xontel_helper/dashboard`,
+    `/api/v1/xontel_queue/callactions`,
+    `/api/v1/explorer/queries/`,
+    `/api/v1/cdr/?from_date=${y}&to_date=${y}&page=1&size=3`,
+    `/api/v1/cdr/?start_date=${y}&end_date=${y}&page=1&size=3`,
   ];
-  // Keep only the fields that answer the question, so a day's rows fit.
+  // The shape matters more than the volume: keys, a count and the head of the body.
   const compact = (j) => {
-    const rows = Array.isArray(j) ? j : j?.results || j?.abandoned_calls_page_obj?.data;
-    if (!Array.isArray(rows)) return JSON.stringify(j).slice(0, 4000);
-    const seen = new Set();
-    const lines = [];
-    for (const r of rows) {
-      const line = [r.id, r.status ?? r.call_status, r.from_time ?? r.time ?? r.assigned_time, r.to_time ?? r.assignee ?? r.agent, r.caller ?? '', r.queue ?? '', r.assigned_time ?? '']
-        .map((v) => (v === null || v === undefined ? '' : String(v))).join(' | ');
-      if (!seen.has(line)) { seen.add(line); lines.push(line); }
-    }
-    return `count=${j?.count ?? rows.length} distinct=${lines.length}\n` + lines.join('\n').slice(0, 9000);
+    const rows = Array.isArray(j) ? j : j?.results || j?.data;
+    const keys = rows && rows[0] && typeof rows[0] === 'object' ? Object.keys(rows[0]) : Object.keys(j || {});
+    return { count: j?.count ?? (Array.isArray(rows) ? rows.length : null), pages: j?.pages ?? null, keys, head: JSON.stringify(j).slice(0, 3500) };
   };
-  const out = { at: Date.now() };
+  const out = { at: Date.now(), day: y };
   for (const p of paths) {
     try {
       out[p] = compact(await xontelGet(p));
@@ -4858,8 +5095,11 @@ api.get('/xontel/day', requireRole('ADMIN'), wrap(async (req, res) => {
     phantomCallSeconds: Math.max(0,
       inDay.filter((s) => s.status === 'in call').reduce((n, s) => n + clippedSec(s), 0)
       - callRows.reduce((n, c) => n + (c.talk_sec || 0), 0)),
-    answeredCalls: callRows.filter((c) => (c.talk_sec || 0) > 0).length,
-    missedCalls: callRows.filter((c) => !(c.talk_sec > 0)).length,
+    // Customer calls only, by the CDR's own status. An outgoing call nobody
+    // picked up is not a missed call, and a connected one is not an answered
+    // customer call (the 47-"missed" bug of 2026-10-01, here as well).
+    answeredCalls: callRows.filter((c) => c.direction === 'Incoming' && c.status === 'Answered').length,
+    missedCalls: callRows.filter((c) => c.direction === 'Incoming' && c.status !== 'Answered').length,
     totals: [...timeline.reduce((m, s) => {
       const cur = m.get(s.status) || { status: s.status, seconds: 0, count: 0, signedIn: s.signedIn, available: s.available };
       cur.seconds += s.durationSec;
@@ -5622,6 +5862,9 @@ initDb()
       setInterval(xontelFullStatusSync, XONTEL_FULL_POLL_MS);
       // One-time history backfill, after the first live poll has settled.
       setTimeout(() => xontelBackfillOnce().catch((e) => console.error('[xontel] backfill failed:', e.message)), 3 * 60 * 1000);
+      // Cheap when nothing is owed, and it is what closes a gap left by an
+      // outage (tunnel down for days) without waiting for the next deploy.
+      setInterval(() => xontelBackfillOnce().catch((e) => console.error('[xontel] backfill failed:', e.message)), 6 * 60 * 60 * 1000);
       // Missed-call history: small enough to re-read whole on every start.
       setTimeout(() => xontelMissedBackfill().catch((e) => console.error('[xontel] missed-call history failed:', e.message)), 2 * 60 * 1000);
       // One-off, read-only look at XonTel's missed-call lists and dashboard

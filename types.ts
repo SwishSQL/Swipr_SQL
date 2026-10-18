@@ -608,6 +608,20 @@ export interface KpiTargets {
   lateLoginMaxMin: number;
 }
 
+// ---- Reporting setup (aggregator numbers, queue -> brand / issue, status classes) ----
+export interface ReportAggregator { number: string; aggregator: string; kind: string; note?: string | null }
+export interface ReportQueue { queue: string; brand: string; issue: string; note?: string | null }
+export interface ReportStatus { status: string; class: string }
+export interface ReportConfig {
+  canEdit: boolean;
+  aggregators: ReportAggregator[];
+  queues: ReportQueue[];
+  statuses: ReportStatus[];
+  unmapped: { queues: { queue: string; calls: number }[]; callers: { number: string; calls: number }[]; statuses: { status: string; hours: number }[] };
+  classes: string[];
+  kinds: string[];
+}
+
 // ---- Missed customer calls (XonTel's queue-level Missed Calls list) -----------
 export interface MissedCallback {
   agent: string;              // Swipr name when linked, else the XonTel username
