@@ -828,6 +828,60 @@ async function xontelSyncCalls({ fromDate, toDate, full = false }) {
 }
 const XONTEL_CDR_PAGE = 500;
 
+// "00: 00: 06" (the report pads its colons) -> seconds.
+const xontelWaitSec = (v) => {
+  const m = String(v ?? '').replace(/\s+/g, '').match(/^(\d+):(\d{1,2}):(\d{1,2})(?:\.\d+)?$/);
+  return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : null;
+};
+
+// One Kuwait day of Report 28. XonTel runs the saved query for the window and
+// returns every queue at once when no queuename is given (652 rows on
+// 2026-10-17, XonTel's own incoming_answered for that day). Rows are
+// [queue, connect time (Kuwait, no zone), agent username, caller, wait].
+// Returns the report's row count next to the CDR's answered-incoming count for
+// the day, so a day where the two disagree can be seen instead of trusted.
+async function xontelSyncWaits(day) {
+  const q = new URLSearchParams({ from: `${day} 00:00:00`, to: `${day} 23:59:59`, lang: 'en' });
+  const data = await xontelGet(`/api/v1/explorer/query/execute/28?${q}`);
+  const rows = Array.isArray(data?.data) ? data.data : [];
+  const now = Date.now();
+  const out = [];
+  for (const r of rows) {
+    const connect = xontelTs(r?.[1]), wait = xontelWaitSec(r?.[4]);
+    if (connect === null || wait === null) continue;
+    out.push({ id: `${connect}|${r[3]}|${r[2]}|${r[0]}`, queue: r[0] ?? null, agent: r[2] ?? null, caller: r[3] === null || r[3] === undefined ? null : String(r[3]), connect, wait });
+  }
+  if (out.length) {
+    await pool.query(
+      `INSERT INTO xontel_call_waits (id, day, queue, agent, caller, connect_ts, wait_sec, fetched_at)
+       SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::bigint[], $7::int[], $8::bigint[])
+       ON CONFLICT (id) DO UPDATE SET wait_sec = EXCLUDED.wait_sec, fetched_at = EXCLUDED.fetched_at`,
+      [out.map((o) => o.id), out.map(() => day), out.map((o) => o.queue), out.map((o) => o.agent), out.map((o) => o.caller),
+       out.map((o) => o.connect), out.map((o) => o.wait), out.map(() => now)]
+    );
+  }
+  // Match onto the CDR: same caller and agent, connect inside the call's own
+  // window. A day either side of the window, since a call near midnight can
+  // be filed under either date.
+  const lo = atKuwait(day, '00:00') - 24 * 3600e3, hi = atKuwait(day, '00:00') + 48 * 3600e3;
+  const { rowCount: matched } = await pool.query(
+    `UPDATE xontel_calls c SET connect_ts = w.connect_ts, wait_sec = w.wait_sec
+       FROM xontel_call_waits w
+      WHERE w.day = $1 AND c.direction = 'Incoming' AND c.status = 'Answered'
+        AND c.start_ts >= $2 AND c.start_ts < $3
+        AND c.caller_number = w.caller AND lower(c.agent_name) = lower(w.agent)
+        AND w.connect_ts >= c.start_ts - 2000 AND w.connect_ts <= c.start_ts + (c.duration_sec + 2) * 1000
+        AND (c.connect_ts IS DISTINCT FROM w.connect_ts OR c.wait_sec IS DISTINCT FROM w.wait_sec)`,
+    [day, lo, hi]
+  );
+  const { rows: [{ n: cdrAnswered }] } = await pool.query(
+    `SELECT count(*)::int AS n FROM xontel_calls
+      WHERE direction = 'Incoming' AND status = 'Answered' AND xontel_agent_id IS NOT NULL AND start_ts >= $1 AND start_ts < $2`,
+    [atKuwait(day, '00:00'), atKuwait(addDays(day, 1), '00:00')]
+  );
+  return { rows: out.length, matched, cdrAnswered };
+}
+
 // ---- Missed customer calls ---------------------------------------------------
 // Two feeds, both found by watching XonTel's own Missed Calls page:
 //   xontel_helper/missed_calls_dashboard — what that page lists: calls a
@@ -990,6 +1044,10 @@ async function xontelFullStatusSync() {
     const today = dayKeyInAppTz(Date.now());
     const r = await xontelSync({ fromDate: addDays(today, -1), toDate: today, full: true });
     if (r.stored) console.log(`[xontel] full status pass: ${r.stored} session(s) healed over ${r.pages} page(s)`);
+    // Wait times for yesterday and today, on their own try: a slow report must not cost the sessions.
+    for (const d of [addDays(today, -1), today]) {
+      try { await xontelSyncWaits(d); } catch (e) { console.error(`[xontel] wait times ${d} failed:`, e.message); }
+    }
   } catch (e) {
     console.error('[xontel] full status pass failed:', e.message);
   } finally {
@@ -1007,7 +1065,8 @@ const XONTEL_FULL_POLL_MS = 15 * 60 * 1000;
 const XONTEL_BACKFILL_FROM = process.env.XONTEL_BACKFILL_FROM || '2026-09-17';
 // v3: the CDR was read with from_date/to_date until 2026-10-18 (see xontelSyncCalls), so a run recorded
 // under an older key may have called days done that it never really read.
-const XONTEL_BACKFILL_KEY = 'xontel_backfill3';
+// v4: adds the wait-time part (Report 28) to every day.
+const XONTEL_BACKFILL_KEY = 'xontel_backfill4';
 const XONTEL_BACKFILL_MAX_TRIES = 6;
 const XONTEL_BACKFILL_RETRY_MS = 30 * 60 * 1000;
 
@@ -1023,7 +1082,7 @@ function xontelBackfillWork(marker, from, to) {
     if ((f.tries || 0) < XONTEL_BACKFILL_MAX_TRIES && f.day >= from && f.day <= to) add(f.day, f.part);
   }
   const next = marker?.through && marker.through >= from ? addDays(marker.through, 1) : from;
-  for (let d = next; d <= to; d = addDays(d, 1)) { add(d, 'sessions'); add(d, 'calls'); }
+  for (let d = next; d <= to; d = addDays(d, 1)) { add(d, 'sessions'); add(d, 'calls'); add(d, 'waits'); }
   return new Map([...work.entries()].sort((a, b) => a[0].localeCompare(b[0])));
 }
 
@@ -1041,15 +1100,20 @@ async function xontelBackfillOnce() {
   const failed = (marker?.failed || []).filter((f) => (f.tries || 0) >= XONTEL_BACKFILL_MAX_TRIES);
   const empty = (marker?.empty || []).filter((d) => !work.has(d));
   let days = 0, sessions = 0, calls = 0;
+  const waitGaps = (marker?.waitGaps || []).filter((g) => !work.has(g.day));
   for (const [d, parts] of work) {
     while (xontelBusy) await new Promise((r) => setTimeout(r, 2000));
     xontelBusy = true;
     try {
-      for (const part of ['sessions', 'calls']) {
+      for (const part of ['sessions', 'calls', 'waits']) {
         if (!parts.has(part)) continue;
         try {
           if (part === 'sessions') sessions += (await xontelSync({ fromDate: d, toDate: d, full: true })).stored;
-          else {
+          else if (part === 'waits') {
+            const w = await xontelSyncWaits(d);
+            // The report and the CDR should agree on how many calls were answered; a gap is worth seeing.
+            if (Math.abs(w.rows - w.cdrAnswered) > Math.max(3, w.cdrAnswered * 0.02)) waitGaps.push({ day: d, report: w.rows, cdr: w.cdrAnswered, matched: w.matched });
+          } else {
             const c = await xontelSyncCalls({ fromDate: d, toDate: d, full: true });
             calls += c.stored;
             if (c.received === 0) empty.push(d);
@@ -1069,7 +1133,7 @@ async function xontelBackfillOnce() {
   await pool.query(
     `INSERT INTO sync_state (id, last_sync_at, detail) VALUES ($1, $2, $3::jsonb)
      ON CONFLICT (id) DO UPDATE SET last_sync_at = EXCLUDED.last_sync_at, detail = EXCLUDED.detail`,
-    [XONTEL_BACKFILL_KEY, Date.now(), J({ done: !failed.length, from, through: to, failed, empty: [...new Set(empty)].sort(), days, sessions, calls, at: Date.now() })]
+    [XONTEL_BACKFILL_KEY, Date.now(), J({ done: !failed.length, from, through: to, failed, empty: [...new Set(empty)].sort(), waitGaps, days, sessions, calls, at: Date.now() })]
   );
   console.log(`[xontel] backfill finished: ${days} day(s) visited, ${sessions} session(s), ${calls} call(s) healed, ${failed.length} failed part(s)`);
   if (retriable.length) setTimeout(() => xontelBackfillOnce().catch((e) => console.error('[xontel] backfill retry failed:', e.message)), XONTEL_BACKFILL_RETRY_MS);
