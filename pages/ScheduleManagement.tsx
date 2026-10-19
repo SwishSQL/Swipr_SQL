@@ -932,6 +932,41 @@ export default function ScheduleManagement() {
     setShowRangeExportModal(false);
   };
 
+  // Every schedule on record, from the first day anyone was rostered up to the
+  // end of the current week (Sunday–Saturday), for the employees the filters
+  // currently show. Only days that actually have an entry are listed, so an
+  // employee isn't padded with empty "day off" rows for months before they started.
+  const exportAllHistory = () => {
+    const ymd = (d: Date) => format(d, 'yyyy-MM-dd');
+    const endOfWeek = new Date(); endOfWeek.setHours(12, 0, 0, 0); endOfWeek.setDate(endOfWeek.getDate() + (6 - endOfWeek.getDay()));
+    const lastDay = ymd(endOfWeek);
+    const rows: any[] = [];
+    let firstDay = '';
+    [...filteredEmployees].sort((a, b) => a.name.localeCompare(b.name)).forEach(emp => {
+      Object.keys(allSchedules[emp.id] || {}).sort().forEach(dateStr => {
+        if (dateStr > lastDay) return;
+        const dayData = (allSchedules[emp.id] || {})[dateStr];
+        if (!dayData) return;
+        if (!firstDay || dateStr < firstDay) firstDay = dateStr;
+        const isOffDay = [DayType.DAY_OFF, DayType.ABSENT, DayType.PUBLIC_HOLIDAY, DayType.ANNUAL_LEAVE, DayType.SICK].includes(dayData.type);
+        rows.push({
+          'Day': format(new Date(dateStr + 'T12:00:00'), 'EEEE'),
+          'Date': dateStr,
+          'ID': emp.employeeId || 'N/A',
+          'Employee Name': emp.name,
+          'Company': unitOf(emp) || 'Swipr',
+          'Type': dayData.type || 'DAY_OFF',
+          'Start Time': isOffDay ? '--:--' : (dayData.shift?.startTime || '--:--'),
+          'End Time': isOffDay ? '--:--' : (dayData.shift?.endTime || '--:--')
+        });
+      });
+    });
+    if (!rows.length) { alert('There are no saved schedules for the employees in this view.'); return; }
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(rows), 'All Schedules');
+    XLSX.writeFile(workbook, `Swipr_All_Schedules_${firstDay}_to_${lastDay}.xlsx`);
+  };
+
   const getEmployeeSummary = (empId: string) => {
     const empSchedules = allSchedules[empId] || {};
     const summary = {
@@ -1318,6 +1353,14 @@ export default function ScheduleManagement() {
               >
                 <Sparkles size={18} />
                 <span>AI Schedule</span>
+              </button>
+              <button
+                onClick={exportAllHistory}
+                className="flex items-center gap-2 px-5 py-3 bg-amber-500 text-white rounded-2xl hover:bg-amber-600 transition-all shadow-lg shadow-amber-100 active:scale-95 text-[10px] font-black uppercase tracking-widest"
+                title="Download every saved schedule, from the very first one to the end of this week, for the employees shown (respects the company / brand / team leader filters)"
+              >
+                <Download size={18} />
+                <span>All Schedules</span>
               </button>
               <button
                 onClick={handleCopyLastWeek}
