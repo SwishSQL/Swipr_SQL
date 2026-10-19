@@ -608,6 +608,35 @@ export interface KpiTargets {
   lateLoginMaxMin: number;
 }
 
+// ---- Calls report (Ops email 1.1 / 1.4) ----------------------------------------
+export type CallsGroup = 'hour' | 'day' | 'week' | 'month' | 'quarter' | 'year';
+export interface CallsStat {
+  answered: number;
+  waitN: number;              // calls the queue wait is known for
+  waitAvgSec: number | null;
+  waitMaxSec: number;
+  talkSec: number;
+  connN: number;              // calls the CONNECT time is known for
+  ahtTrueSec: number | null;  // call end - CONNECT, over connN
+  ahtApproxSec: number | null; // billsec / answered, includes IVR and queue time
+}
+export interface CallsReport {
+  from: string; to: string; group: CallsGroup; days: number;
+  callCenterAgents: number;
+  dataStart: number | null;
+  otherAgentsAnswered: number;
+  options: { brands: string[]; issues: string[]; aggregators: string[] };
+  totals: CallsStat & { waitBuckets: { lt10: number; lt20: number; lt30: number; gte30: number }; waitCoverage: number | null };
+  series: (CallsStat & { key: string })[];
+  brands: (CallsStat & { brand: string; issue: string })[];
+  aggregators: (CallsStat & { aggregator: string })[];
+  outgoing: {
+    calls: number; answered: number; talkSec: number; ahtAllSec: number | null; ahtAnsweredSec: number | null;
+    byStatus: { status: string; calls: number; talkSec: number }[];
+    series: { key: string; calls: number }[];
+  };
+}
+
 // ---- Reporting setup (aggregator numbers, queue -> brand / issue, status classes) ----
 export interface ReportAggregator { number: string; aggregator: string; kind: string; note?: string | null }
 export interface ReportQueue { queue: string; brand: string; issue: string; note?: string | null }

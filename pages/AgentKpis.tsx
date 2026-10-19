@@ -3,7 +3,7 @@ import * as XLSX from 'xlsx';
 import { format } from 'date-fns';
 import { Download, Search, X, AlertTriangle, ChevronUp, ChevronDown, SlidersHorizontal, Fingerprint, PhoneMissed, ListChecks, Plus, Trash2 } from 'lucide-react';
 import { store } from '../store';
-import { AgentKpiReport, AgentKpiRow, AdherenceReport, AdherenceRow, KpiTargets, MissedReport, MissedCall, ReportConfig } from '../types';
+import { AgentKpiReport, AgentKpiRow, AdherenceReport, AdherenceRow, KpiTargets, MissedReport, MissedCall, ReportConfig, CallsReport, CallsGroup } from '../types';
 
 // ---------------------------------------------------------------------------
 // Agent performance — call-centre KPIs per agent, from XonTel data.
@@ -36,6 +36,8 @@ const ymd = (d: Date) => format(d, 'yyyy-MM-dd');
 const PRESETS: { key: string; label: string; range: () => [string, string] }[] = [
   { key: 'today', label: 'Today', range: () => [ymd(new Date()), ymd(new Date())] },
   { key: 'yesterday', label: 'Yesterday', range: () => { const d = new Date(); d.setDate(d.getDate() - 1); return [ymd(d), ymd(d)]; } },
+  { key: 'last7', label: 'Last 7 days', range: () => { const d = new Date(); const f = new Date(); f.setDate(f.getDate() - 6); return [ymd(f), ymd(d)]; } },
+  { key: 'last30', label: 'Last 30 days', range: () => { const d = new Date(); const f = new Date(); f.setDate(f.getDate() - 29); return [ymd(f), ymd(d)]; } },
   { key: 'month', label: 'This month', range: () => { const d = new Date(); return [ymd(new Date(d.getFullYear(), d.getMonth(), 1)), ymd(d)]; } },
   { key: 'lastMonth', label: 'Last month', range: () => { const d = new Date(); return [ymd(new Date(d.getFullYear(), d.getMonth() - 1, 1)), ymd(new Date(d.getFullYear(), d.getMonth(), 0))]; } },
 ];
@@ -229,13 +231,20 @@ export default function AgentKpis() {
   const [error, setError] = useState('');
   const [tip, setTip] = useState<Tip>(null);
   const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: 'answered', dir: -1 });
-  const [tab, setTab] = useState<'kpis' | 'adherence' | 'missed'>('kpis');
+  const [tab, setTab] = useState<'kpis' | 'adherence' | 'missed' | 'calls'>('kpis');
   const [adh, setAdh] = useState<AdherenceReport | null>(null);
   const [adhLoading, setAdhLoading] = useState(true);
   const [adhError, setAdhError] = useState('');
   const [missed, setMissed] = useState<MissedReport | null>(null);
   const [missedLoading, setMissedLoading] = useState(true);
   const [missedError, setMissedError] = useState('');
+  const [callsGroup, setCallsGroup] = useState<CallsGroup>('day');
+  const [cBrand, setCBrand] = useState('');
+  const [cIssue, setCIssue] = useState('');
+  const [cAgg, setCAgg] = useState('');
+  const [calls, setCalls] = useState<CallsReport | null>(null);
+  const [callsLoading, setCallsLoading] = useState(false);
+  const [callsError, setCallsError] = useState('');
   const [targets, setTargets] = useState<KpiTargets | null>(null);
   const [targetsOpen, setTargetsOpen] = useState(false);
   const [setupOpen, setSetupOpen] = useState(false);
@@ -277,6 +286,23 @@ export default function AgentKpis() {
     return () => { live = false; };
   }, [from, to]);
   useEffect(() => { store.getKpiTargets().then(setTargets).catch(() => {}); }, []);
+  // The calls report is heavier than the other tabs, so it loads only while it is open.
+  useEffect(() => {
+    if (tab !== 'calls') return;
+    let live = true;
+    setCallsLoading(true); setCallsError('');
+    store.getCallsReport(from, to, callsGroup, cBrand, cIssue, cAgg)
+      .then((r) => { if (live) setCalls(r); })
+      .catch((e: any) => {
+        if (!live) return;
+        const m = String(e?.message || '').match(/\{.*\}/s);
+        let msg = 'Could not load the calls report.';
+        try { msg = (m && JSON.parse(m[0])?.error) || msg; } catch { /* keep default */ }
+        setCallsError(msg);
+      })
+      .finally(() => { if (live) setCallsLoading(false); });
+    return () => { live = false; };
+  }, [tab, from, to, callsGroup, cBrand, cIssue, cAgg]);
 
   // Which targets an agent's figures fall outside of (see TargetsModal).
   const breaches = (r: AgentKpiRow): string[] => {
@@ -364,6 +390,19 @@ export default function AgentKpis() {
         'XonTel login': t(r.loginTs), 'Login late (min)': r.loginLateMin ?? '', 'XonTel logout': t(r.logoutTs), 'Logged out early (min)': r.earlyLogoutMin ?? '',
         'Signed in (min)': Math.round(r.signedInSec / 60), 'Adherence %': r.adherencePct ?? '', Status: ADH_LABEL[r.status],
       }))), 'Adherence');
+    }
+    if (calls && calls.from === from && calls.to === to) {
+      const sec = (v: number | null) => (v === null ? '' : v);
+      const stat = (x: CallsReport['totals']) => ({ Answered: x.answered, 'Avg wait (s)': sec(x.waitAvgSec), 'Max wait (s)': x.waitMaxSec, 'AHT (s)': sec(x.ahtTrueSec), 'AHT incl. IVR (s)': sec(x.ahtApproxSec), 'Talk (min)': Math.round(x.talkSec / 60) });
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(calls.series.map((p) => ({ Period: p.key, ...stat(p as any) }))), 'Calls by period');
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(calls.brands.map((b) => ({ Brand: b.brand, Issue: b.issue, ...stat(b as any) }))), 'Brand x issue');
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(calls.aggregators.map((a) => ({ Aggregator: a.aggregator, ...stat(a as any) }))), 'Aggregators');
+      const wb2 = calls.totals.waitBuckets;
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet([{ 'Under 10 s': wb2.lt10, '10 to under 20 s': wb2.lt20, '20 to under 30 s': wb2.lt30, '30 s or more': wb2.gte30 }]), 'Wait distribution');
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet([
+        ...calls.outgoing.byStatus.map((x) => ({ Disposition: x.status, Calls: x.calls, 'Talk (min)': Math.round(x.talkSec / 60) })),
+        { Disposition: 'TOTAL', Calls: calls.outgoing.calls, 'Talk (min)': Math.round(calls.outgoing.talkSec / 60), 'AHT per call (s)': sec(calls.outgoing.ahtAllSec), 'AHT per answered call (s)': sec(calls.outgoing.ahtAnsweredSec) },
+      ]), 'Outbound');
     }
     if (missed?.calls.length) {
       const t = (ms: number | null) => (ms ? format(new Date(ms), 'yyyy-MM-dd HH:mm') : '');
@@ -457,7 +496,7 @@ export default function AgentKpis() {
       </div>
 
       <div className="inline-flex p-1 bg-gray-100 rounded-2xl">
-        {([['kpis', 'Calls & time'], ['adherence', 'Shift adherence'], ['missed', 'Missed customers']] as const).map(([k, l]) => (
+        {([['kpis', 'Calls & time'], ['adherence', 'Shift adherence'], ['missed', 'Missed customers'], ['calls', 'Calls report']] as const).map(([k, l]) => (
           <button key={k} onClick={() => setTab(k)}
             className={`px-4 py-2 rounded-xl text-sm font-bold transition-colors ${tab === k ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-800'}`}>
             {l}
@@ -465,7 +504,10 @@ export default function AgentKpis() {
         ))}
       </div>
 
-      {tab === 'missed' ? (
+      {tab === 'calls' ? (
+        <CallsReportTab report={calls} loading={callsLoading} error={callsError} group={callsGroup} setGroup={setCallsGroup}
+          brand={cBrand} setBrand={setCBrand} issue={cIssue} setIssue={setCIssue} agg={cAgg} setAgg={setCAgg} setTip={setTip} />
+      ) : tab === 'missed' ? (
         <MissedTab report={missed} loading={missedLoading} error={missedError} unit={unit} query={query} multiDay={multiDay} today={today} setTip={setTip} />
       ) : tab === 'adherence' ? (
         <AdherenceTab report={adh} rows={adhRows} loading={adhLoading} error={adhError} targets={targets} multiDay={multiDay} today={today} />
@@ -764,6 +806,243 @@ const QueueChart: React.FC<{ calls: MissedCall[]; setTip: (t: Tip) => void }> = 
           );
         })}
       </svg>
+    </div>
+  );
+};
+
+// ---- Calls report ------------------------------------------------------------
+// Floor-wide answered customer calls (Call Center only) with queue wait and
+// true handle time, by period, brand and issue, aggregator, plus outbound.
+const GROUPS: { key: CallsGroup; label: string }[] = [
+  { key: 'hour', label: 'Hour' }, { key: 'day', label: 'Day' }, { key: 'week', label: 'Week' },
+  { key: 'month', label: 'Month' }, { key: 'quarter', label: 'Quarter' }, { key: 'year', label: 'Year' },
+];
+const secLabel = (v: number | null) => (v === null ? '—' : v < 60 ? `${v}s` : mmss(v));
+const periodAxis = (k: string, g: CallsGroup) =>
+  g === 'hour' ? k.slice(11, 13) : g === 'day' ? String(Number(k.slice(8))) : g === 'week' ? format(new Date(k + 'T00:00:00'), 'MMM d')
+    : g === 'month' ? format(new Date(k + '-01T00:00:00'), 'MMM') : g === 'quarter' ? k.slice(5) : k;
+const periodTitle = (k: string, g: CallsGroup) =>
+  g === 'hour' ? `${format(new Date(k.slice(0, 10) + 'T00:00:00'), 'EEE, MMM d')} · ${k.slice(11)}` : g === 'day' ? format(new Date(k + 'T00:00:00'), 'EEE, MMM d')
+    : g === 'week' ? `Week of ${format(new Date(k + 'T00:00:00'), 'MMM d')}` : g === 'month' ? format(new Date(k + '-01T00:00:00'), 'MMMM yyyy') : k;
+
+const PeriodChart: React.FC<{ report: CallsReport; setTip: (t: Tip) => void }> = ({ report, setTip }) => {
+  const [ref, w] = useWidth();
+  const pts = report.series, g = report.group;
+  const max = Math.max(1, ...pts.map((p) => p.answered));
+  const tk = ticks(max);
+  const H = 300, padB = 26, padT = 12, padL = 14 + 7 * Math.max(...tk.map((t) => num(t).length));
+  const top = tk[tk.length - 1] || 1;
+  const plotW = w - padL - 4, plotH = H - padB - padT;
+  const slot = plotW / Math.max(1, pts.length);
+  const bw = Math.min(28, Math.max(3, slot - 4));
+  const y = (v: number) => padT + plotH - (v / top) * plotH;
+  const every = pts.length > 16 ? Math.ceil(pts.length / 10) : 1;
+  if (!pts.length) return <p className="text-sm text-gray-400 py-16 text-center">No answered calls in this range.</p>;
+  return (
+    <div ref={ref} className="w-full min-w-0 overflow-hidden">
+      <svg viewBox={`0 0 ${w} ${H}`} style={{ width: '100%', height: 'auto', display: 'block' }} role="img" aria-label={`Answered calls by ${g}`}>
+        {tk.map((t) => (
+          <g key={t}>
+            <line x1={padL} x2={w - 4} y1={y(t)} y2={y(t)} stroke={t === 0 ? 'var(--base)' : 'var(--grid)'} strokeWidth={1} />
+            <text x={padL - 8} y={y(t)} dy="0.32em" textAnchor="end" fontSize="11" fill="var(--ink-3)" style={{ fontVariantNumeric: 'tabular-nums' }}>{num(t)}</text>
+          </g>
+        ))}
+        {pts.map((p, i) => {
+          const cx = padL + i * slot + slot / 2, h = (p.answered / top) * plotH;
+          const show = () => ({ title: periodTitle(p.key, g), rows: [
+            { label: 'answered', value: num(p.answered), color: 'var(--c-talk)' },
+            { label: 'avg wait', value: secLabel(p.waitAvgSec) },
+            { label: 'avg handle', value: secLabel(p.ahtTrueSec) },
+          ] });
+          return (
+            <g key={p.key}>
+              <rect x={padL + i * slot} y={padT} width={slot} height={plotH} fill="transparent" className="kpi-mark" tabIndex={0}
+                onPointerMove={(e) => setTip({ x: e.clientX, y: e.clientY, ...show() })} onPointerLeave={() => setTip(null)}
+                onFocus={(e) => { const r = (e.target as SVGRectElement).getBoundingClientRect(); setTip({ x: r.x + r.width / 2, y: r.y + 20, ...show() }); }} onBlur={() => setTip(null)} />
+              {p.answered > 0 && <path d={colPath(cx - bw / 2, y(p.answered), bw, h)} fill="var(--c-talk)" pointerEvents="none" />}
+              {i % every === 0 && <text x={cx} y={H - 8} textAnchor="middle" fontSize="11" fill="var(--ink-3)">{periodAxis(p.key, g)}</text>}
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+};
+
+const CallsReportTab: React.FC<{
+  report: CallsReport | null; loading: boolean; error: string; group: CallsGroup; setGroup: (g: CallsGroup) => void;
+  brand: string; setBrand: (v: string) => void; issue: string; setIssue: (v: string) => void; agg: string; setAgg: (v: string) => void;
+  setTip: (t: Tip) => void;
+}> = ({ report, loading, error, group, setGroup, brand, setBrand, issue, setIssue, agg, setAgg, setTip }) => {
+  if (error) return <div className="bg-rose-50 border border-rose-100 rounded-2xl px-5 py-4 text-sm font-bold text-rose-600">{error}</div>;
+  if (!report) return <p className="text-center py-24 text-gray-400">Loading the calls report…</p>;
+  const t = report.totals, wb = t.waitBuckets, wbTotal = wb.lt10 + wb.lt20 + wb.lt30 + wb.gte30;
+  const pct = (v: number, of: number) => (of ? Math.round((v / of) * 100) : 0);
+  const sel = 'px-3 py-2 rounded-xl bg-white border border-gray-100 text-sm font-bold text-gray-900 outline-none focus:ring-4 focus:ring-blue-500/10';
+  const issues = [...new Set(report.brands.map((b) => b.issue))].sort((a, b) => a.localeCompare(b));
+  const brandNames = [...new Set(report.brands.map((b) => b.brand))].sort((a, b) => a.localeCompare(b));
+  const cell = (b: string, i: string) => report.brands.find((x) => x.brand === b && x.issue === i);
+  const brandTotal = (b: string) => report.brands.filter((x) => x.brand === b).reduce((s, x) => s + x.answered, 0);
+  const wbSegs = [
+    { label: 'Under 10 s', v: wb.lt10, o: 0.3 }, { label: '10 to under 20 s', v: wb.lt20, o: 0.55 },
+    { label: '20 to under 30 s', v: wb.lt30, o: 0.8 }, { label: '30 s or more', v: wb.gte30, o: 1 },
+  ];
+  const o = report.outgoing;
+  return (
+    <div className={`space-y-8 transition-opacity ${loading ? 'opacity-50' : ''}`}>
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="inline-flex p-1 bg-gray-100 rounded-2xl">
+          {GROUPS.map((g) => (
+            <button key={g.key} onClick={() => setGroup(g.key)}
+              className={`px-3.5 py-1.5 rounded-xl text-sm font-bold transition-colors ${group === g.key ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-800'}`}>{g.label}</button>
+          ))}
+        </div>
+        <select value={brand} onChange={(e) => setBrand(e.target.value)} aria-label="Brand" className={sel}><option value="">All brands</option>{report.options.brands.map((x) => <option key={x}>{x}</option>)}</select>
+        <select value={issue} onChange={(e) => setIssue(e.target.value)} aria-label="Issue" className={sel}><option value="">All call types</option>{report.options.issues.map((x) => <option key={x}>{x}</option>)}</select>
+        <select value={agg} onChange={(e) => setAgg(e.target.value)} aria-label="Aggregator" className={sel}><option value="">Aggregators and customers</option>{report.options.aggregators.map((x) => <option key={x}>{x}</option>)}</select>
+        {(brand || issue || agg) && <button onClick={() => { setBrand(''); setIssue(''); setAgg(''); }} className="text-xs font-bold text-gray-500 hover:text-gray-800 inline-flex items-center gap-1"><X size={12} /> Clear filters</button>}
+      </div>
+
+      {report.callCenterAgents === 0 && (
+        <div className="p-4 bg-amber-50 border border-amber-100 rounded-2xl text-sm text-amber-800">This report covers Call Center agents only, and none are in your scope.</div>
+      )}
+      {report.callCenterAgents > 0 && (t.waitCoverage === null || t.waitCoverage < 98 || report.otherAgentsAnswered > 0) && (
+        <div className="p-4 bg-amber-50 border border-amber-100 rounded-2xl text-xs text-amber-800 leading-relaxed space-y-1">
+          {t.waitCoverage !== null && t.waitCoverage < 98 && <p><span className="font-bold">Wait time is known for {t.waitCoverage}% of these calls</span> — the rest are days XonTel's wait report hasn't been read for yet. Wait and handle averages use only the calls it covers.</p>}
+          {report.otherAgentsAnswered > 0 && <p>{num(report.otherAgentsAnswered)} more answered calls went to agents outside the Call Center department, or not linked to anyone here, and are not counted.</p>}
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-px bg-gray-100 rounded-[28px] overflow-hidden border border-gray-100">
+        {[
+          { label: 'Answered calls', value: num(t.answered), sub: `${report.callCenterAgents} Call Center agents` },
+          { label: 'Average wait', value: secLabel(t.waitAvgSec), sub: t.waitMaxSec ? `longest ${mmss(t.waitMaxSec)}` : 'in the queue' },
+          { label: 'Handle time (AHT)', value: secLabel(t.ahtTrueSec), sub: t.ahtApproxSec === null ? 'call end − CONNECT' : `${mmss(t.ahtApproxSec)} counting IVR and wait` },
+          { label: 'Answered within 10 s', value: wbTotal ? `${pct(wb.lt10, wbTotal)}%` : '—', sub: wbTotal ? `${pct(wb.gte30, wbTotal)}% waited 30 s or more` : 'no wait data' },
+          { label: 'Outgoing calls', value: num(o.calls), sub: `${num(o.answered)} answered` },
+          { label: 'Outgoing AHT', value: secLabel(o.ahtAllSec), sub: o.ahtAnsweredSec === null ? 'talk per call' : `${mmss(o.ahtAnsweredSec)} per answered call` },
+        ].map((x) => (
+          <div key={x.label} className="bg-white min-w-0 px-5 sm:px-6 py-5">
+            <p className="text-sm font-semibold text-gray-500">{x.label}</p>
+            <p className="text-[26px] sm:text-[34px] leading-tight font-black text-gray-900 tracking-tight mt-1">{x.value}</p>
+            <p className="text-xs text-gray-400 mt-0.5">{x.sub}</p>
+          </div>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-1 xl:grid-cols-5 gap-6">
+        <section className="xl:col-span-3 min-w-0 bg-white rounded-[28px] border border-gray-100 p-5 sm:p-6">
+          <h2 className="text-lg font-black text-gray-900 mb-4">Answered calls by {group}</h2>
+          <PeriodChart report={report} setTip={setTip} />
+        </section>
+        <section className="xl:col-span-2 min-w-0 bg-white rounded-[28px] border border-gray-100 p-5 sm:p-6">
+          <h2 className="text-lg font-black text-gray-900">How long callers waited</h2>
+          <p className="text-xs text-gray-400 mt-0.5 mb-5">Queue wait until an agent connected · {num(wbTotal)} calls with wait data</p>
+          {wbTotal === 0 ? <p className="text-sm text-gray-400 py-6">No wait data for this range yet.</p> : (
+            <>
+              <div className="flex h-6 w-full rounded-full overflow-hidden" style={{ gap: 2, background: 'var(--surface)' }} role="img" aria-label="Wait time distribution">
+                {wbSegs.filter((s) => s.v > 0).map((s) => <span key={s.label} title={`${s.label}: ${num(s.v)}`} style={{ width: `${(s.v / wbTotal) * 100}%`, background: 'var(--c-talk)', opacity: s.o, minWidth: 3 }} />)}
+              </div>
+              <table className="w-full text-sm mt-5">
+                <tbody className="divide-y divide-gray-50">
+                  {wbSegs.map((s) => (
+                    <tr key={s.label}>
+                      <td className="py-2"><span className="inline-block w-2.5 h-2.5 rounded-sm mr-2 align-middle" style={{ background: 'var(--c-talk)', opacity: s.o }} />{s.label}</td>
+                      <td className="py-2 text-right font-bold text-gray-900 tabular-nums">{num(s.v)}</td>
+                      <td className="py-2 text-right text-gray-400 tabular-nums w-14">{pct(s.v, wbTotal)}%</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
+          )}
+        </section>
+      </div>
+
+      <section className="bg-white rounded-[28px] border border-gray-100 overflow-hidden">
+        <div className="px-6 pt-6 pb-4">
+          <h2 className="text-lg font-black text-gray-900">Brand and call type</h2>
+          <p className="text-xs text-gray-400 mt-0.5">Answered calls · average wait underneath · from the queue list in Reporting setup</p>
+        </div>
+        {brandNames.length === 0 ? <p className="px-6 pb-10 pt-2 text-sm text-gray-400">No answered calls in this range.</p> : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="border-y border-gray-100 bg-gray-50/50"><tr>
+                <th className="px-3 py-3 pl-6 text-left text-xs font-bold text-gray-500">Brand</th>
+                {issues.map((i) => <th key={i} className="px-3 py-3 text-right text-xs font-bold text-gray-500 whitespace-nowrap">{i}</th>)}
+                <th className="px-3 py-3 pr-6 text-right text-xs font-bold text-gray-500">Total</th>
+              </tr></thead>
+              <tbody className="divide-y divide-gray-50">
+                {brandNames.map((b) => (
+                  <tr key={b} className="hover:bg-gray-50/50">
+                    <td className="px-3 py-3 pl-6 font-bold text-gray-900 whitespace-nowrap">{b}</td>
+                    {issues.map((i) => { const c = cell(b, i); return (
+                      <td key={i} className="px-3 py-3 text-right tabular-nums">
+                        {c ? <><span className="font-bold text-gray-900">{num(c.answered)}</span><span className="block text-[11px] text-gray-400">{secLabel(c.waitAvgSec)}</span></> : <span className="text-gray-300">—</span>}
+                      </td>); })}
+                    <td className="px-3 py-3 pr-6 text-right font-black text-gray-900 tabular-nums">{num(brandTotal(b))}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+        <section className="bg-white rounded-[28px] border border-gray-100 overflow-hidden">
+          <div className="px-6 pt-6 pb-4">
+            <h2 className="text-lg font-black text-gray-900">Aggregators and customers</h2>
+            <p className="text-xs text-gray-400 mt-0.5">By the number the call came from · "Customer" is any number not in the aggregator list</p>
+          </div>
+          <table className="w-full text-sm">
+            <thead className="border-y border-gray-100 bg-gray-50/50"><tr>
+              {['Source', 'Answered', 'Share', 'Avg wait', 'AHT'].map((h, i) => <th key={h} className={`px-3 py-3 text-xs font-bold text-gray-500 ${i === 0 ? 'text-left pl-6' : 'text-right'} ${i === 4 ? 'pr-6' : ''}`}>{h}</th>)}
+            </tr></thead>
+            <tbody className="divide-y divide-gray-50">
+              {report.aggregators.map((a) => (
+                <tr key={a.aggregator} className="hover:bg-gray-50/50">
+                  <td className="px-3 py-3 pl-6 font-bold text-gray-900">{a.aggregator}</td>
+                  <td className="px-3 py-3 text-right font-bold text-gray-900 tabular-nums">{num(a.answered)}</td>
+                  <td className="px-3 py-3 text-right text-gray-500 tabular-nums">{pct(a.answered, t.answered)}%</td>
+                  <td className="px-3 py-3 text-right text-gray-600 tabular-nums">{secLabel(a.waitAvgSec)}</td>
+                  <td className="px-3 py-3 pr-6 text-right text-gray-600 tabular-nums">{secLabel(a.ahtTrueSec)}</td>
+                </tr>
+              ))}
+              {report.aggregators.length === 0 && <tr><td className="px-6 py-8 text-sm text-gray-400" colSpan={5}>No answered calls in this range.</td></tr>}
+            </tbody>
+          </table>
+        </section>
+
+        <section className="bg-white rounded-[28px] border border-gray-100 overflow-hidden">
+          <div className="px-6 pt-6 pb-4">
+            <h2 className="text-lg font-black text-gray-900">Outgoing calls</h2>
+            <p className="text-xs text-gray-400 mt-0.5">By how each call ended · {num(o.calls)} calls · {dur(o.talkSec)} talk · the brand and source filters don't apply</p>
+          </div>
+          <table className="w-full text-sm">
+            <thead className="border-y border-gray-100 bg-gray-50/50"><tr>
+              {['Disposition', 'Calls', 'Share', 'Talk'].map((h, i) => <th key={h} className={`px-3 py-3 text-xs font-bold text-gray-500 ${i === 0 ? 'text-left pl-6' : 'text-right'} ${i === 3 ? 'pr-6' : ''}`}>{h}</th>)}
+            </tr></thead>
+            <tbody className="divide-y divide-gray-50">
+              {o.byStatus.map((x) => (
+                <tr key={x.status} className="hover:bg-gray-50/50">
+                  <td className="px-3 py-3 pl-6 font-bold text-gray-900">{x.status}</td>
+                  <td className="px-3 py-3 text-right font-bold text-gray-900 tabular-nums">{num(x.calls)}</td>
+                  <td className="px-3 py-3 text-right text-gray-500 tabular-nums">{pct(x.calls, o.calls)}%</td>
+                  <td className="px-3 py-3 pr-6 text-right text-gray-600 tabular-nums">{dur(x.talkSec)}</td>
+                </tr>
+              ))}
+              {o.byStatus.length === 0 && <tr><td className="px-6 py-8 text-sm text-gray-400" colSpan={4}>No outgoing calls in this range.</td></tr>}
+            </tbody>
+          </table>
+        </section>
+      </div>
+
+      <p className="text-xs text-gray-400 leading-relaxed">
+        Wait is the time in the queue before an agent connected and handle time runs from that CONNECT to the end of the call, both from XonTel's "Calls waiting time" report.
+        The figure under AHT counts from the moment the call arrived, so it includes the IVR and the queue. Weeks start on Sunday.
+        {report.dataStart ? ` Calls are collected from ${format(new Date(report.dataStart), 'MMM d, yyyy')}.` : ''}
+      </p>
     </div>
   );
 };

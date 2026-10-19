@@ -22,6 +22,8 @@ import {
   KpiTargets,
   MissedReport,
   ReportConfig,
+  CallsReport,
+  CallsGroup,
   SickDocument,
   SickDocsAdminView,
   AttendanceRecord,
@@ -582,6 +584,11 @@ export class Store {
 
   async saveKpiTargets(t: Partial<KpiTargets>): Promise<KpiTargets> {
     return http('PUT', '/agent-kpis/targets', t);
+  }
+
+  async getCallsReport(from: string, to: string, group: CallsGroup, brand = '', issue = '', aggregator = ''): Promise<CallsReport> {
+    const q = new URLSearchParams({ from, to, group, brand, issue, aggregator });
+    return http('GET', `/agent-kpis/calls-report?${q}`);
   }
 
   async getReportConfig(): Promise<ReportConfig> {

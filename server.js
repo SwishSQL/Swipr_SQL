@@ -4600,6 +4600,119 @@ api.put('/agent-kpis/report-config', requireRole('ADMIN'), wrap(async (req, res)
   res.json({ ok: true });
 }));
 
+// ---- Calls report (Ops email 1.1 + 1.4): floor-wide, Call Center only ----------
+// Answered incoming calls by period, brand / issue and aggregator, with the
+// queue wait and the true handle time from Report 28, plus the outgoing block.
+// "Call Center only": agents linked to a user whose department is Call
+// Center, within what the viewer may see (kpiAgentsFor — a Complain lead gets
+// nothing, adminOnly people are left out for non-admins). Calls answered by
+// anyone else are counted in `otherAgents` so the exclusion is visible.
+//
+// Brand, issue and aggregator come from the Reporting setup tables at query
+// time. A queue not in the list reports as "Unmapped", a caller not in the
+// aggregator list as "Customer".
+//   wait   = Report 28's queue wait; only calls it was matched to count
+//   handle = call end - CONNECT (the CDR's arrival time includes ~25 s of IVR)
+//   AHT (approx) = billsec / answered, which includes that IVR and queue time
+const CALLS_REPORT_MAX_DAYS = 400, CALLS_REPORT_MAX_HOUR_DAYS = 92;
+const CALLS_REPORT_WEEK_STARTS_SUNDAY = true;    // Ops to confirm (question 11)
+const callsPeriodSql = (group) => ({
+  hour: `to_char(date_trunc('hour', lt), 'YYYY-MM-DD HH24:00')`,
+  day: `to_char(lt, 'YYYY-MM-DD')`,
+  week: CALLS_REPORT_WEEK_STARTS_SUNDAY
+    ? `to_char(date_trunc('week', lt + interval '1 day') - interval '1 day', 'YYYY-MM-DD')`
+    : `to_char(date_trunc('week', lt), 'YYYY-MM-DD')`,
+  month: `to_char(lt, 'YYYY-MM')`,
+  quarter: `to_char(lt, 'YYYY-"Q"Q')`,
+  year: `to_char(lt, 'YYYY')`,
+})[group];
+const CALLS_CALLER_NORM = `CASE WHEN length(x.d) > 8 AND x.d LIKE '965%' THEN substr(x.d, 4) ELSE x.d END`;
+const callsCte = (outgoing) => `WITH base AS (
+  SELECT c.start_ts, c.duration_sec, c.talk_sec, c.status, c.connect_ts, c.wait_sec,
+         (to_timestamp(c.start_ts / 1000.0) AT TIME ZONE 'Asia/Kuwait') AS lt,
+         coalesce(m.brand, 'Unmapped') AS brand, coalesce(m.issue, 'Unmapped') AS issue,
+         coalesce(a.aggregator, 'Customer') AS aggregator
+    FROM xontel_calls c
+    CROSS JOIN LATERAL (SELECT regexp_replace(regexp_replace(coalesce(c.caller_number, ''), '[^0-9]', '', 'g'), '^00', '') AS d) x
+    LEFT JOIN xontel_queue_map m ON lower(m.queue) = lower(c.queue)
+    LEFT JOIN xontel_aggregator_numbers a ON a.number = ${CALLS_CALLER_NORM}
+   WHERE c.start_ts >= $1 AND c.start_ts < $2 AND c.xontel_agent_id = ANY($3)
+     AND c.direction = '${outgoing ? 'Outgoing' : 'Incoming'}'${outgoing ? '' : " AND c.status = 'Answered'"}
+) `;
+const CALLS_FILTER = `WHERE ($4::text = '' OR brand = $4) AND ($5::text = '' OR issue = $5) AND ($6::text = '' OR aggregator = $6)`;
+const CALLS_STATS = `count(*)::int AS answered, coalesce(sum(talk_sec), 0)::float AS talk,
+  count(wait_sec)::int AS wait_n, coalesce(sum(wait_sec), 0)::float AS wait_sum, coalesce(max(wait_sec), 0)::int AS wait_max,
+  count(connect_ts)::int AS conn_n,
+  coalesce(sum(GREATEST(0, (start_ts + duration_sec * 1000 - connect_ts) / 1000.0)) FILTER (WHERE connect_ts IS NOT NULL), 0)::float AS handle_sum`;
+
+api.get('/agent-kpis/calls-report', requireRole(...KPI_ROLES), wrap(async (req, res) => {
+  const today = dayKeyInAppTz(Date.now());
+  const DAY = /^\d{4}-\d{2}-\d{2}$/;
+  const from = String(req.query.from || addDays(today, -6)), to = String(req.query.to || today);
+  if (!DAY.test(from) || !DAY.test(to)) return res.status(400).json({ error: 'from/to must be YYYY-MM-DD' });
+  if (to < from) return res.status(400).json({ error: '"To" is before "From".' });
+  const days = (atKuwait(addDays(to, 1), '00:00') - atKuwait(from, '00:00')) / DAY_MS;
+  if (days > CALLS_REPORT_MAX_DAYS) return res.status(400).json({ error: `Pick at most ${CALLS_REPORT_MAX_DAYS} days.` });
+  const group = ['hour', 'day', 'week', 'month', 'quarter', 'year'].includes(req.query.group) ? req.query.group : 'day';
+  if (group === 'hour' && days > CALLS_REPORT_MAX_HOUR_DAYS) return res.status(400).json({ error: `Hourly view is limited to ${CALLS_REPORT_MAX_HOUR_DAYS} days.` });
+  const lo = atKuwait(from, '00:00'), hi = atKuwait(addDays(to, 1), '00:00');
+  const str = (v) => String(v ?? '').slice(0, 80);
+  const brand = str(req.query.brand), issue = str(req.query.issue), aggregator = str(req.query.aggregator);
+
+  const { agents } = await kpiAgentsFor(req);
+  const cc = agents.filter((a) => nrm(a.user.companyName) === 'call center');
+  const ids = cc.map((a) => a.agentId);
+  const P = [lo, hi, ids, brand, issue, aggregator];
+  const per = callsPeriodSql(group);
+  const [tot, series, byBi, byAgg, outTot, outSeries, outByStatus, opts, other, first] = await Promise.all([
+    pool.query(`${callsCte(false)} SELECT ${CALLS_STATS},
+        count(*) FILTER (WHERE wait_sec < 10)::int AS b1, count(*) FILTER (WHERE wait_sec >= 10 AND wait_sec < 20)::int AS b2,
+        count(*) FILTER (WHERE wait_sec >= 20 AND wait_sec < 30)::int AS b3, count(*) FILTER (WHERE wait_sec >= 30)::int AS b4
+        FROM base ${CALLS_FILTER}`, P),
+    pool.query(`${callsCte(false)} SELECT ${per} AS k, ${CALLS_STATS} FROM base ${CALLS_FILTER} GROUP BY 1 ORDER BY 1`, P),
+    pool.query(`${callsCte(false)} SELECT brand, issue, ${CALLS_STATS} FROM base ${CALLS_FILTER} GROUP BY 1, 2 ORDER BY 3 DESC`, P),
+    pool.query(`${callsCte(false)} SELECT aggregator, ${CALLS_STATS} FROM base ${CALLS_FILTER} GROUP BY 1 ORDER BY 2 DESC`, P),
+    pool.query(`${callsCte(true)} SELECT count(*)::int AS calls, count(*) FILTER (WHERE status = 'Answered')::int AS answered,
+        coalesce(sum(talk_sec) FILTER (WHERE status = 'Answered'), 0)::float AS talk FROM base`, P.slice(0, 3)),
+    pool.query(`${callsCte(true)} SELECT ${per} AS k, count(*)::int AS calls FROM base GROUP BY 1 ORDER BY 1`, P.slice(0, 3)),
+    pool.query(`${callsCte(true)} SELECT status, count(*)::int AS calls, coalesce(sum(talk_sec), 0)::float AS talk FROM base GROUP BY 1 ORDER BY 2 DESC`, P.slice(0, 3)),
+    pool.query(`SELECT 'brand' AS t, brand AS v FROM xontel_queue_map UNION SELECT 'issue', issue FROM xontel_queue_map
+                UNION SELECT 'aggregator', aggregator FROM xontel_aggregator_numbers`),
+    pool.query(
+      `SELECT count(*)::int AS n FROM xontel_calls WHERE start_ts >= $1 AND start_ts < $2 AND direction = 'Incoming' AND status = 'Answered'
+          AND xontel_agent_id IS NOT NULL AND NOT (xontel_agent_id = ANY($3))`, [lo, hi, ids]),
+    pool.query('SELECT min(start_ts) AS ts FROM xontel_calls'),
+  ]);
+  const n = (v) => Number(v) || 0;
+  const stat = (r) => ({
+    answered: r.answered, waitN: r.wait_n, waitAvgSec: r.wait_n ? Math.round(n(r.wait_sum) / r.wait_n) : null, waitMaxSec: r.wait_max,
+    talkSec: Math.round(n(r.talk)), connN: r.conn_n,
+    ahtTrueSec: r.conn_n ? Math.round(n(r.handle_sum) / r.conn_n) : null,
+    ahtApproxSec: r.answered ? Math.round(n(r.talk) / r.answered) : null,
+  });
+  const t = tot.rows[0];
+  const optSet = (k) => [...new Set(opts.rows.filter((r) => r.t === k).map((r) => r.v))].sort((a, b) => a.localeCompare(b));
+  const o = outTot.rows[0];
+  res.json({
+    from, to, group, days: Math.round(days),
+    callCenterAgents: cc.length,
+    dataStart: first.rows[0]?.ts === null || first.rows[0]?.ts === undefined ? null : Number(first.rows[0].ts),
+    otherAgentsAnswered: other.rows[0].n,
+    options: { brands: [...optSet('brand'), 'Unmapped'], issues: [...optSet('issue'), 'Unmapped'], aggregators: [...optSet('aggregator'), 'Customer'] },
+    totals: { ...stat(t), waitBuckets: { lt10: t.b1, lt20: t.b2, lt30: t.b3, gte30: t.b4 }, waitCoverage: t.answered ? Math.round((t.wait_n / t.answered) * 100) : null },
+    series: series.rows.map((r) => ({ key: r.k, ...stat(r) })),
+    brands: byBi.rows.map((r) => ({ brand: r.brand, issue: r.issue, ...stat(r) })),
+    aggregators: byAgg.rows.map((r) => ({ aggregator: r.aggregator, ...stat(r) })),
+    outgoing: {
+      calls: o.calls, answered: o.answered, talkSec: Math.round(n(o.talk)),
+      ahtAllSec: o.calls ? Math.round(n(o.talk) / o.calls) : null,            // the email's formula: handle / all outbound calls
+      ahtAnsweredSec: o.answered ? Math.round(n(o.talk) / o.answered) : null,
+      byStatus: outByStatus.rows.map((r) => ({ status: r.status || 'Unknown', calls: r.calls, talkSec: Math.round(n(r.talk)) })),
+      series: outSeries.rows.map((r) => ({ key: r.k, calls: r.calls })),
+    },
+  });
+}));
+
 // Shift adherence rows for the viewer's agents (see agentAdherence).
 api.get('/agent-kpis/adherence', requireRole(...KPI_ROLES), wrap(async (req, res) => {
   const range = kpiRange(req, res);
