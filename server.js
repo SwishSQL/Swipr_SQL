@@ -439,9 +439,31 @@ async function sweepLateness() {
 const XONTEL_ENV_BASE_URL = (process.env.XONTEL_BASE_URL || '').replace(/\/+$/, '');
 const XONTEL_DISCOVER_URL = (process.env.XONTEL_DISCOVER_URL || '').replace(/\/+$/, '');
 let xontelBaseUrlOverride = null;
+// An address an admin typed in (Attendance -> link XonTel accounts) wins over
+// everything: a quick tunnel gets a new hostname on every restart, and this
+// lets the new one be put in without a Railway redeploy. Next, the address
+// followed from the QA system (only while discovery is on), then the env var.
+let xontelPinnedUrl = null;
 function xontelBaseUrl() {
-  return xontelBaseUrlOverride || XONTEL_ENV_BASE_URL;
+  return xontelPinnedUrl || (XONTEL_DISCOVER_URL && xontelBaseUrlOverride) || XONTEL_ENV_BASE_URL;
 }
+
+// XonTel moved to a new server on 2026-10-19 (172.16.210.161). Its web app is
+// new; the old API lives on under /pbx/api/v1, so a base URL ending in /pbx is
+// the new server. What differs there, all checked live 2026-10-20:
+//  - the call list is pbx_core/cdr/list (from_date / end_date as ISO UTC
+//    instants, at most 200 rows a page) with new field names;
+//  - every time is UTC ("...Z") and date-only filters are UTC days, so a
+//    Kuwait day D needs UTC day D-1 too (Kuwait D = UTC D-1 21:00 .. D 21:00);
+//  - row ids, session ids and agent ids all started again from 1. Rows from
+//    the new server are stored as "x2:<id>" so they can never collide with
+//    the old server's history; agent ids are migrated once (xontelMoveAgentIds);
+//  - the missed-calls dashboard needs a date range (500 without one), lists
+//    rows under "results", and swapped queue / queue_number.
+const xontelV2 = () => /\/pbx$/.test(xontelBaseUrl());
+const xontelRowId = (id) => (xontelV2() ? `x2:${id}` : String(id));
+// Kuwait day -> the UTC calendar days that cover it.
+const xontelUtcFrom = (kuwaitDay) => (xontelV2() ? addDays(kuwaitDay, -1) : kuwaitDay);
 
 // Asks the QA system which address it is currently using. Only ever widens
 // what we know: a failure leaves the configured URL untouched.
@@ -489,6 +511,7 @@ const XONTEL_AVAILABLE_STATUSES = new Set(
 // hundred distinct sessions and a whole day takes ~14 of them.
 const XONTEL_PAGE_SIZE = 2000;
 const XONTEL_MAX_PAGES = 40;
+const XONTEL_MAX_PAGES_V2 = 400;
 
 function xontelHasCredentials() {
   return !!(process.env.XONTEL_TOKEN || (process.env.XONTEL_USERNAME && process.env.XONTEL_PASSWORD));
@@ -663,8 +686,9 @@ const xontelParse = (r) => {
   const start = xontelTs(pick(r, ['from_time', 'start_time', 'start', 'created_at', 'time']));
   if (!agent.id || start === null) return null;
   const status = String(pick(r, ['status', 'event', 'state']) ?? 'unknown');
+  const rid = pick(r, ['id', 'pk']);
   return {
-    id: String(pick(r, ['id', 'pk']) ?? `${agent.id}:${start}:${status}`),
+    id: rid === null ? `${agent.id}:${start}:${status}` : xontelRowId(rid),
     agentId: agent.id, agentName: agent.name, status, start,
     end: xontelTs(pick(r, ['to_time', 'end_time', 'end'])),
     dur: xontelDurationSec(pick(r, ['duration', 'total_duration'])),
@@ -682,10 +706,14 @@ const xontelParse = (r) => {
 async function xontelSync({ fromDate, toDate, full = false, pageSize = XONTEL_PAGE_SIZE }) {
   const now = Date.now();
   let received = 0, stored = 0, pages = 0;
+  // The new server caps a page at 200 rows and still repeats each session
+  // ~28 times (27,767 rows for one day on 2026-10-19), so a full read of a
+  // day is ~140 pages there.
+  const maxPages = xontelV2() && full ? XONTEL_MAX_PAGES_V2 : XONTEL_MAX_PAGES;
 
-  for (let page = 1; page <= XONTEL_MAX_PAGES; page++) {
+  for (let page = 1; page <= maxPages; page++) {
     const data = await xontelGet(
-      `/api/v1/account/agentstatus?from_date=${fromDate}&to_date=${toDate}&page=${page}&size=${pageSize}`
+      `/api/v1/account/agentstatus?from_date=${xontelUtcFrom(fromDate)}&to_date=${toDate}&page=${page}&size=${pageSize}`
     );
     const rows = Array.isArray(data) ? data : (data?.results || []);
     pages++;
@@ -755,12 +783,48 @@ const xontelUniqueId = (url) => String(url ?? '').match(/-(\d{9,11}\.\d+)\.[A-Za
 // and never reached anything older than about two weeks (probe, 2026-10-18;
 // the same trap the QA system hit in September). count / total_pages in the
 // reply ignore the window as well, so the end of the data is a short page.
+// One new-server CDR row in the old row's terms. Checked against the live list
+// 2026-10-20: call_start_time is UTC, bill_second the answered part,
+// destination_username the queue name for incoming calls and the dialled
+// number for outgoing ones (as the old dst was), source the caller (or the
+// outbound caller id), call_type Incoming / Outgoing / Internal.
+const XONTEL_DISPOSITIONS = { ANSWERED: 'Answered', 'NO ANSWER': 'No Answer', BUSY: 'Busy', FAILED: 'Failed', CONGESTION: 'Congestion' };
+function xontelCdrV2(r) {
+  const start = xontelTs(r?.call_start_time);
+  if (start === null || r?.id === undefined || r?.id === null) return null;
+  const rec = r.recording_file || r.file_data || null;
+  const base = xontelBaseUrl();
+  return {
+    uniqueid: r.unique_id ? String(r.unique_id) : null,
+    did: r.did ?? null,
+    raw: r,
+    id: `x2:${r.id}`,
+    agentId: r.agent_id === null || r.agent_id === undefined ? null : String(r.agent_id),
+    agentName: r.agent ?? null,
+    start,
+    dur: Number.isFinite(Number(r.duration_in_seconds)) ? Math.round(Number(r.duration_in_seconds)) : (xontelDurationSec(r.duration) ?? 0),
+    talk: Number.isFinite(Number(r.bill_second)) ? Math.max(0, Math.round(Number(r.bill_second))) : 0,
+    direction: r.call_type ?? null,
+    status: r.call_status?.value ?? XONTEL_DISPOSITIONS[String(r.disposition || '').toUpperCase()] ?? r.disposition ?? null,
+    number: r.source ?? r.caller_id ?? r.caller_number ?? null,
+    queue: r.destination_username ?? r.destination ?? null,
+    rec: rec && !/^https?:/.test(rec) ? `${base}/${String(rec).replace(/^\/+/, '')}` : rec,
+  };
+}
+const XONTEL_CDR_PAGE_V2 = 200;
+
 async function xontelSyncCalls({ fromDate, toDate, full = false }) {
   const now = Date.now();
   let received = 0, stored = 0, pages = 0;
+  const v2 = xontelV2();
+  const pageSize = v2 ? XONTEL_CDR_PAGE_V2 : XONTEL_CDR_PAGE;
+  // The new server takes the window as UTC instants: Kuwait midnight to midnight.
+  const v2Window = () => `from_date=${new Date(atKuwait(fromDate, '00:00')).toISOString()}&end_date=${new Date(atKuwait(addDays(toDate, 1), '00:00') - 1000).toISOString()}`;
 
-  for (let page = 1; page <= XONTEL_MAX_PAGES; page++) {
-    const data = await xontelGet(`/api/v1/cdr/?start_date=${fromDate}&end_date=${toDate}&page=${page}&size=${XONTEL_CDR_PAGE}`);
+  for (let page = 1; page <= (v2 && full ? XONTEL_MAX_PAGES_V2 : XONTEL_MAX_PAGES); page++) {
+    const data = await xontelGet(v2
+      ? `/api/v1/pbx_core/cdr/list?${v2Window()}&page=${page}&size=${pageSize}&page_size=${pageSize}`
+      : `/api/v1/cdr/?start_date=${fromDate}&end_date=${toDate}&page=${page}&size=${XONTEL_CDR_PAGE}`);
     const rows = Array.isArray(data) ? data : (data?.results || []);
     pages++;
     received += rows.length;
@@ -768,6 +832,7 @@ async function xontelSyncCalls({ fromDate, toDate, full = false }) {
 
     const out = [];
     for (const r of rows) {
+      if (v2) { const o = xontelCdrV2(r); if (o) out.push(o); continue; }
       const start = xontelCdrTs(r?.cdr_time);
       const id = r?.id ?? r?.uniqueid;
       if (start === null || id === undefined || id === null) continue;
@@ -821,7 +886,7 @@ async function xontelSyncCalls({ fromDate, toDate, full = false }) {
       stored += changed;
     }
 
-    if (rows.length < XONTEL_CDR_PAGE) break;                       // a short page is the end of the window
+    if (rows.length < pageSize) break;                              // a short page is the end of the window
     if (!full && changed === 0) break;
   }
   return { received, stored, pages };
@@ -841,7 +906,10 @@ const xontelWaitSec = (v) => {
 // Returns the report's row count next to the CDR's answered-incoming count for
 // the day, so a day where the two disagree can be seen instead of trusted.
 async function xontelSyncWaits(day) {
-  const q = new URLSearchParams({ from: `${day} 00:00:00`, to: `${day} 23:59:59`, lang: 'en' });
+  // The new server reads the window as UTC: the Kuwait day is 21:00 the day before to 20:59:59.
+  const q = xontelV2()
+    ? new URLSearchParams({ from: `${addDays(day, -1)} 21:00:00`, to: `${day} 20:59:59`, lang: 'en' })
+    : new URLSearchParams({ from: `${day} 00:00:00`, to: `${day} 23:59:59`, lang: 'en' });
   const data = await xontelGet(`/api/v1/explorer/query/execute/28?${q}`);
   const rows = Array.isArray(data?.data) ? data.data : [];
   const now = Date.now();
@@ -904,11 +972,12 @@ async function xontelSyncMissed({ fromDate, toDate, full = false }) {
 
   // The date range is only sent on a backfill; whether the dashboard honours
   // it is unknown, and the rows that do come back are kept either way.
-  const dated = full ? `&from_date=${fromDate}&to_date=${toDate}` : '';
+  // The new server answers 500 without a range, so there it is always sent.
+  const dated = full || xontelV2() ? `&from_date=${xontelUtcFrom(fromDate)}&to_date=${toDate}` : '';
   for (let page = 1; page <= 10; page++) {
     const data = await xontelGet(`/api/v1/xontel_helper/missed_calls_dashboard?page=${page}&page_size=${XONTEL_MISSED_PAGE}${dated}`);
     const obj = data?.abandoned_calls_page_obj;
-    const rows = Array.isArray(obj?.data) ? obj.data : [];
+    const rows = Array.isArray(obj?.data) ? obj.data : Array.isArray(obj?.results) ? obj.results : [];
     pages++;
     if (!rows.length) break;
     const out = [];
@@ -916,8 +985,10 @@ async function xontelSyncMissed({ fromDate, toDate, full = false }) {
       const ts = xontelTs(r?.time);
       if (r?.id === undefined || r?.id === null || ts === null) continue;
       out.push({
-        id: String(r.id), uniq: r.uniqueid ?? null,
-        caller: r.caller ?? r.number ?? null, queue: r.queue ?? r.queue_number ?? null,
+        id: xontelRowId(r.id), uniq: r.uniqueid ?? null,
+        // The new server swapped them: queue is the number, queue_number the name.
+        caller: r.caller ?? r.number ?? null,
+        queue: (/^[0-9]+$/.test(String(r.queue ?? '')) ? r.queue_number : r.queue) ?? r.queue_number ?? null,
         status: String(r.status ?? 'Pending'), ts,
         assignee: r.assignee ?? null, assignedTs: xontelTs(r.assigned_time), closed: !!r.close, raw: r,
       });
@@ -946,7 +1017,7 @@ async function xontelSyncMissed({ fromDate, toDate, full = false }) {
   }
 
   for (let page = 1; page <= XONTEL_MAX_PAGES; page++) {
-    const data = await xontelGet(`/api/v1/xontel_queue/missedcallhistory?from_date=${fromDate}&to_date=${toDate}&page=${page}&size=${XONTEL_MISSED_PAGE}`);
+    const data = await xontelGet(`/api/v1/xontel_queue/missedcallhistory?from_date=${xontelUtcFrom(fromDate)}&to_date=${toDate}&page=${page}&size=${XONTEL_MISSED_PAGE}`);
     const rows = Array.isArray(data?.results) ? data.results : [];
     pages++;
     if (!rows.length) break;
@@ -955,7 +1026,7 @@ async function xontelSyncMissed({ fromDate, toDate, full = false }) {
       const ts = xontelTs(r?.assigned_time);
       if (r?.id === undefined || r?.id === null || ts === null) continue;
       out.push({
-        id: String(r.id), callId: r.call === null || r.call === undefined ? null : String(r.call),
+        id: xontelRowId(r.id), callId: r.call === null || r.call === undefined ? null : xontelRowId(r.call),
         agent: r.agent ?? null, caller: r.caller ?? null, outcome: String(r.call_status ?? ''), ts, raw: r,
       });
     }
@@ -999,6 +1070,11 @@ async function xontelPoll() {
     // on every cloudflared restart, and a stale one looks exactly like an outage.
     if (XONTEL_DISCOVER_URL) await xontelDiscoverBaseUrl();
     if (!xontelBaseUrl()) return;
+    try { await xontelMoveAgentIds(); } catch (e) {
+      xontelLastError = `agent id move: ${e.message}`;
+      console.error('[xontel] agent id move failed:', e.message);
+      return;                                                      // never read the new server under the old ids
+    }
     const today = dayKeyInAppTz(Date.now());
     const from = addDays(today, -XONTEL_POLL_DAYS);
     try {
@@ -1037,8 +1113,53 @@ async function xontelPoll() {
 // really several hours of status. This reads every page of the recent window
 // (full), so a long session is captured once it ends; on its own slower
 // timer to keep the cost off the responsive polls.
+// The new server numbered its agents afresh (Samah_Yasser 70 -> 33, ...), and
+// every link, call and session stores the agent id. Once, before anything is
+// read from the new server: each old id becomes the new id of the agent with
+// the same username, in the links and in all stored history together, so the
+// history stays on the right person. An agent the new server doesn't have
+// keeps "old:<id>" (still consistent, shown under Unlinked to relink).
+async function xontelMoveAgentIds() {
+  if (!xontelV2()) return true;
+  const done = (await pool.query(`SELECT 1 FROM sync_state WHERE id = 'xontel_v2_agent_ids'`)).rows.length > 0;
+  if (done) return true;
+  const f = await xontelGet('/api/v1/pbx_core/cdr/filter');
+  const agents = (f?.agent || []).map((a) => ({ id: String(a?.value ?? ''), name: String(a?.label ?? '') })).filter((a) => a.id && a.name);
+  if (agents.length < 5) throw new Error(`only ${agents.length} agents listed by the new server; not moving ids`);
+  const names = agents.map((a) => a.name.toLowerCase()), ids = agents.map((a) => a.id);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const m = 'SELECT * FROM UNNEST($1::text[], $2::text[]) AS t(name, nid)';
+    await client.query(`UPDATE xontel_agent_map SET xontel_agent_id = 'tmp:' || xontel_agent_id`);
+    const { rowCount: links } = await client.query(
+      `UPDATE xontel_agent_map x SET xontel_agent_id = coalesce((SELECT nid FROM (${m}) t WHERE t.name = lower(x.xontel_agent_name)), 'old:' || substr(x.xontel_agent_id, 5))`, [names, ids]);
+    const { rowCount: calls } = await client.query(
+      `UPDATE xontel_calls c SET xontel_agent_id = coalesce((SELECT nid FROM (${m}) t WHERE t.name = lower(c.agent_name)), 'old:' || c.xontel_agent_id)
+        WHERE c.id NOT LIKE 'x2:%' AND c.xontel_agent_id IS NOT NULL AND c.xontel_agent_id NOT LIKE 'old:%'`, [names, ids]);
+    const { rowCount: sessions } = await client.query(
+      `UPDATE xontel_sessions s SET xontel_agent_id = coalesce((SELECT nid FROM (${m}) t WHERE t.name = lower(s.xontel_agent_name)), 'old:' || s.xontel_agent_id)
+        WHERE s.id NOT LIKE 'x2:%' AND s.xontel_agent_id NOT LIKE 'old:%'`, [names, ids]);
+    await client.query(
+      `INSERT INTO sync_state (id, last_sync_at, detail) VALUES ('xontel_v2_agent_ids', $1, $2::jsonb) ON CONFLICT (id) DO NOTHING`,
+      [Date.now(), J({ at: Date.now(), agents: agents.length, links, calls, sessions })]);
+    await client.query('COMMIT');
+    console.log(`[xontel] moved agent ids to the new server: ${links} link(s), ${calls} call(s), ${sessions} session(s)`);
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+  return true;
+}
+
+let xontelLastFullAt = 0;
 async function xontelFullStatusSync() {
   if (!xontelConfigured() || xontelBusy) return;
+  // A full read is ~140 pages a day on the new server; hourly is enough there.
+  if (xontelV2() && Date.now() - xontelLastFullAt < 60 * 60 * 1000) return;
+  xontelLastFullAt = Date.now();
   xontelBusy = true;
   try {
     const today = dayKeyInAppTz(Date.now());
@@ -1088,6 +1209,7 @@ function xontelBackfillWork(marker, from, to) {
 
 async function xontelBackfillOnce() {
   if (!xontelConfigured()) return;
+  if (xontelV2() && !(await pool.query(`SELECT 1 FROM sync_state WHERE id = 'xontel_v2_agent_ids'`)).rows.length) return;
   const marker = (await pool.query(`SELECT detail FROM sync_state WHERE id = $1`, [XONTEL_BACKFILL_KEY])).rows[0]?.detail;
   const to = addDays(dayKeyInAppTz(Date.now()), -2);
   const from = XONTEL_BACKFILL_FROM;
@@ -1192,6 +1314,7 @@ async function xontelLiveStatuses() {
 
 async function xontelFastPoll() {
   if (!xontelConfigured() || xontelBusy) return;
+  if (xontelV2() && !(await pool.query(`SELECT 1 FROM sync_state WHERE id = 'xontel_v2_agent_ids'`)).rows.length) return;
   xontelBusy = true;
   try {
     const live = await xontelLiveStatuses();
@@ -1602,6 +1725,18 @@ const REPORT_STATUS_CLASSES = [
   ['Break', 'break'], ['Toilet', 'break'], ['Pray', 'break'], ['Eating', 'break'],
   ['Complain', 'nr'], ['Coaching', 'nr'], ['Reportings', 'nr'], ['Punching', 'nr'], ['Survey', 'nr'], ['Reviews', 'nr'], ['Pause', 'nr'],
 ];
+// The new XonTel server (2026-10-19) renamed several queues (its own queue
+// list, read 2026-10-20). Added once beside the email's names; case-only
+// differences ("BBT Follow UP") already match, since the lookup ignores case.
+// Pew Pew is not in the email, so its rows are marked for Ops to confirm.
+const REPORT_QUEUES_V2 = [
+  ['Shakir New Order', 'Shakir', 'New Order', null], ['Shakir Complaints:', 'Shakir', 'Complaints', null],
+  ['Pattie New order', 'Pattie Pattie', 'New Order', null], ['Forevermore New Order', 'Forever More Queue', 'New Order', null],
+  ['Just C compliant', 'Just C', 'Complaints', null], ['BBT Compliants', 'BBT', 'Complaints', null],
+  ['Chili Pepper Compliants', 'Chili Pepper', 'Complaints', null], ['BBT Redtown New Order', 'BBT', 'Redtown Queue', null],
+  ['Pew Pew New Order', 'Pew Pew', 'New Order', 'Not in the Ops email: confirm'], ['Pew Pew Follow up', 'Pew Pew', 'Follow Up', 'Not in the Ops email: confirm'],
+  ['Pew Pew Complaints', 'Pew Pew', 'Complaints', 'Not in the Ops email: confirm'], ['Pew Pew', 'Pew Pew', 'Pew Pew', 'Not in the Ops email: confirm'],
+];
 const REPORT_NUMBER_KINDS = ['caller', 'dialed', 'ivr'];
 const REPORT_STATUS_CLASS_NAMES = ['available', 'talk', 'break', 'nr', 'offline'];
 
@@ -1627,6 +1762,16 @@ async function seedReportConfig() {
     for (const [queue, brand, issue] of REPORT_QUEUES) {
       await pool.query(`INSERT INTO xontel_queue_map (queue, brand, issue, updated_by, updated_at) VALUES ($1, $2, $3, 'seed', $4) ON CONFLICT DO NOTHING`, [queue, brand, issue, now]);
     }
+  }
+  if (!(await pool.query(`SELECT 1 FROM sync_state WHERE id = 'report_seed_v2'`)).rows.length) {
+    for (const [queue, brand, issue, note] of REPORT_QUEUES_V2) {
+      await pool.query(
+        `INSERT INTO xontel_queue_map (queue, brand, issue, note, updated_by, updated_at)
+         SELECT $1, $2, $3, $4, 'seed', $5 WHERE NOT EXISTS (SELECT 1 FROM xontel_queue_map WHERE lower(queue) = lower($1))`,
+        [queue, brand, issue, note, now]
+      );
+    }
+    await pool.query(`INSERT INTO sync_state (id, last_sync_at, detail) VALUES ('report_seed_v2', $1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`, [now]);
   }
   if (await empty('xontel_status_class')) {
     for (const [status, cls] of REPORT_STATUS_CLASSES) {
@@ -4283,6 +4428,33 @@ api.post('/attendance/lateness/recompute', requireRole('ADMIN'), wrap(async (req
 
 // ---- XonTel link (admin) ---------------------------------------------------
 
+// Set (or clear, with an empty url) the XonTel address. Checked before it is
+// kept: the address must answer the status route the way XonTel does — 401
+// without a token, or 200 — so a typo or a dead tunnel is refused at once.
+// For the new server the address ends in /pbx (…trycloudflare.com/pbx).
+api.put('/xontel/base-url', requireRole('ADMIN'), wrap(async (req, res) => {
+  const raw = String(req.body?.url ?? '').trim().replace(/\/+$/, '');
+  if (raw && !/^https:\/\/[A-Za-z0-9.\-]+(:[0-9]+)?(\/[A-Za-z0-9._\-\/]*)?$/.test(raw)) {
+    return res.status(400).json({ error: 'Use the full https:// address, e.g. https://name.trycloudflare.com/pbx' });
+  }
+  if (raw) {
+    let status = 0;
+    try {
+      const r = await fetch(`${raw}/api/v1/account/agentstatus`, { signal: AbortSignal.timeout(15000), headers: { 'User-Agent': 'Mozilla/5.0 Swipr' } });
+      status = r.status;
+    } catch (e) {
+      return res.status(400).json({ error: `That address does not answer: ${e.cause?.code || e.message}` });
+    }
+    if (status !== 401 && status !== 200) {
+      return res.status(400).json({ error: `That address answered ${status}, not like XonTel. For the new server it must end in /pbx.` });
+    }
+  }
+  xontelPinnedUrl = raw || null;
+  await xontelSaveState({ pinnedBaseUrl: xontelPinnedUrl, pinnedAt: Date.now(), pinnedBy: req.user.id });
+  await logAudit(req, { action: 'xontel.base-url', entityType: 'xontel', entityId: 'base-url', summary: `${req.user.name} set the XonTel address to ${xontelPinnedUrl || '(default)'}` });
+  res.json({ ok: true, baseUrl: xontelBaseUrl() || null, newServer: xontelV2() });
+}));
+
 api.get('/xontel/status', requireRole('ADMIN'), wrap(async (req, res) => {
   const st = await xontelState();
   const { rows: c } = await pool.query(
@@ -4295,6 +4467,8 @@ api.get('/xontel/status', requireRole('ADMIN'), wrap(async (req, res) => {
     configured: xontelConfigured(),
     hasCredentials: xontelHasCredentials(),
     baseUrl: xontelBaseUrl() || null,
+    pinnedBaseUrl: xontelPinnedUrl,
+    newServer: xontelV2(),
     discoverUrl: XONTEL_DISCOVER_URL || null,
     lastSyncAt: st?.last_sync_at ? Number(st.last_sync_at) : null,
     lastError: xontelLastError || st?.detail?.lastError || null,
@@ -4314,7 +4488,7 @@ api.get('/xontel/agent-map', requireRole('ADMIN'), wrap(async (req, res) => {
   if (!xontelConfigured()) return res.status(503).json({ error: 'XonTel is not configured on this server.' });
   let agents = [];
   try {
-    const f = await xontelGet('/api/v1/cdr/filters');
+    const f = await xontelGet(xontelV2() ? '/api/v1/pbx_core/cdr/filter' : '/api/v1/cdr/filters');
     agents = (f?.agent || f?.agents || []).map((a) => ({
       id: String(pick(a, ['value', 'id']) ?? ''), name: String(pick(a, ['label', 'name']) ?? ''),
     })).filter((a) => a.id);
@@ -6037,7 +6211,10 @@ initDb()
     if (xontelHasCredentials()) {
       // A base URL saved earlier (discovered or set by an admin) outlives the
       // restart that replaced this process.
-      xontelState().then((st) => { if (st?.detail?.baseUrl) xontelBaseUrlOverride = st.detail.baseUrl; })
+      xontelState().then((st) => {
+        if (st?.detail?.baseUrl) xontelBaseUrlOverride = st.detail.baseUrl;
+        if (st?.detail?.pinnedBaseUrl) xontelPinnedUrl = st.detail.pinnedBaseUrl;
+      })
         .catch(() => {})
         .finally(() => xontelPoll());
       setInterval(xontelPoll, XONTEL_POLL_MS);

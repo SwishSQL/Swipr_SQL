@@ -478,6 +478,14 @@ export class Store {
   }
 
   // ---- XonTel link (admin only) ----------------------------------------------
+  async getXontelAddress(): Promise<{ baseUrl: string | null; newServer: boolean; lastError: string | null; lastSyncAt: number | null }> {
+    return http('GET', '/xontel/status');
+  }
+
+  async setXontelAddress(url: string): Promise<{ baseUrl: string | null; newServer: boolean }> {
+    return http('PUT', '/xontel/base-url', { url });
+  }
+
   async getXontelAgentMap(): Promise<{ agents: XontelAgent[]; rows: XontelMapRow[] }> {
     return http('GET', '/xontel/agent-map');
   }

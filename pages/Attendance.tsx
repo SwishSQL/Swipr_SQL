@@ -1088,6 +1088,29 @@ function XontelLinkPanel({ onClose }: { onClose: () => void }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
+  // The XonTel address: a quick tunnel's hostname changes on every restart.
+  const [addr, setAddr] = useState('');
+  const [addrInfo, setAddrInfo] = useState<{ baseUrl: string | null; newServer: boolean; lastError: string | null; lastSyncAt: number | null } | null>(null);
+  const [addrMsg, setAddrMsg] = useState('');
+  const [addrBusy, setAddrBusy] = useState(false);
+  const loadAddr = React.useCallback(async () => {
+    try { const a = await store.getXontelAddress(); setAddrInfo(a); setAddr(a.baseUrl || ''); } catch { /* panel still works */ }
+  }, []);
+  useEffect(() => { loadAddr(); }, [loadAddr]);
+  const saveAddr = async () => {
+    setAddrBusy(true); setAddrMsg('');
+    try {
+      await store.setXontelAddress(addr.trim());
+      setAddrMsg('Saved. Swipr reads from this address from the next sync (within 5 minutes).');
+      await loadAddr();
+    } catch (e: any) {
+      const m = String(e?.message || '').match(/\{.*\}/s);
+      let msg = 'Could not save the address.';
+      try { msg = (m && JSON.parse(m[0])?.error) || msg; } catch { /* keep default */ }
+      setAddrMsg(msg);
+    }
+    setAddrBusy(false);
+  };
 
   const load = React.useCallback(async () => {
     setLoading(true);
@@ -1136,6 +1159,18 @@ function XontelLinkPanel({ onClose }: { onClose: () => void }) {
             <p className="text-[10px] font-black uppercase tracking-widest text-gray-300 mt-2">{t('xon.linked')}: {linked} / {rows.length}</p>
           </div>
           <button onClick={onClose} className="w-11 h-11 rounded-2xl flex items-center justify-center bg-gray-50 text-gray-500 hover:bg-gray-100 shrink-0"><X size={16} /></button>
+        </div>
+        <div className="mx-8 mb-4 p-4 rounded-2xl bg-gray-50 border border-gray-100">
+          <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-2">XonTel address{addrInfo?.newServer ? ' · new server' : ''}</p>
+          <div className="flex gap-2">
+            <input value={addr} onChange={e => setAddr(e.target.value)} placeholder="https://name.trycloudflare.com/pbx"
+              className="flex-1 min-w-0 px-3 py-2 rounded-xl bg-white border border-gray-200 text-sm font-mono text-gray-900 outline-none focus:ring-4 focus:ring-blue-500/10" />
+            <button onClick={saveAddr} disabled={addrBusy || !addr.trim() || addr.trim() === addrInfo?.baseUrl}
+              className="px-4 py-2 rounded-xl bg-gray-900 text-white text-xs font-black uppercase tracking-widest disabled:opacity-40">{addrBusy ? 'Checking…' : 'Save'}</button>
+          </div>
+          <p className="text-[11px] text-gray-500 mt-2">
+            {addrMsg || (addrInfo?.lastError ? `Last error: ${addrInfo.lastError}` : addrInfo?.lastSyncAt ? `Last synced ${new Date(addrInfo.lastSyncAt).toLocaleString()}` : 'Paste the tunnel address here whenever it changes. For the new server it ends in /pbx.')}
+          </p>
         </div>
         {error && <div className="mx-8 mb-3 bg-rose-50 border border-rose-100 rounded-2xl px-4 py-3 text-xs font-bold text-rose-600">{error}</div>}
         <div className="flex-1 overflow-y-auto px-8 pb-8 space-y-2">
