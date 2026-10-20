@@ -606,6 +606,9 @@ async function xontelGet(path) {
       );
     }
   }
+  // A 401 after a failed sign-in is the sign-in failing: say why (it is
+  // otherwise only in the console, and the panel shows a bare 401).
+  if (res.status === 401 && xontelLastError) throw new Error(`XonTel sign-in failed: ${xontelLastError}`);
   if (!res.ok) throw new Error(`XonTel API ${res.status} on ${path}`);
   return res.json();
 }
