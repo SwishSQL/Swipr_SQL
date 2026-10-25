@@ -2842,6 +2842,38 @@ api.post('/attendance/device-sync', wrap(async (req, res) => {
   });
 }));
 
+// The tunnel keeper — a small program on an always-on office PC that runs the
+// Cloudflare quick tunnel and tells Swipr its address every time that changes
+// (a quick tunnel gets a new hostname on every restart). It is a machine, so
+// like the fingerprint bridge it authenticates with a shared key, which is why
+// this sits above the JWT gate. Swipr signs in to XonTel THROUGH this address,
+// password included, so the key is as sensitive as the XonTel password: the
+// host is restricted to the tunnel domain and an unset key closes the route.
+const XONTEL_TUNNEL_KEY = process.env.XONTEL_TUNNEL_KEY || '';
+const XONTEL_TUNNEL_HOSTS = (process.env.XONTEL_TUNNEL_HOSTS || 'trycloudflare.com').split(',').map((h) => h.trim().toLowerCase()).filter(Boolean);
+api.post('/xontel/tunnel', wrap(async (req, res) => {
+  if (!XONTEL_TUNNEL_KEY) return res.status(503).json({ error: 'The tunnel keeper is not enabled on this server.' });
+  const given = Buffer.from(String(req.get('X-Tunnel-Key') || ''));
+  const want = Buffer.from(XONTEL_TUNNEL_KEY);
+  if (given.length !== want.length || !crypto.timingSafeEqual(given, want)) return res.status(401).json({ error: 'Invalid tunnel key.' });
+  let url;
+  try { url = new URL(String(req.body?.url ?? '')); } catch { return res.status(400).json({ error: 'Expected { url: "https://…" }.' }); }
+  const host = url.hostname.toLowerCase();
+  if (url.protocol !== 'https:' || !XONTEL_TUNNEL_HOSTS.some((h) => host === h || host.endsWith('.' + h))) {
+    return res.status(400).json({ error: 'That host is not an allowed tunnel host.' });
+  }
+  // The new server's API sits under /pbx.
+  const raw = `https://${url.host}${url.pathname.replace(/\/+$/, '') || '/pbx'}`;
+  const why = await xontelCheckAddress(raw);
+  if (why) return res.status(400).json({ error: why });
+  if (raw !== xontelPinnedUrl) {
+    xontelPinnedUrl = raw;
+    await xontelSaveState({ pinnedBaseUrl: raw, pinnedAt: Date.now(), pinnedBy: 'tunnel-keeper' });
+    console.log(`[xontel] address set by the tunnel keeper: ${raw}`);
+  }
+  res.json({ ok: true, baseUrl: xontelBaseUrl() });
+}));
+
 // ---- Everything below this line requires a valid token --------------------
 api.use(authenticate);
 
@@ -4431,26 +4463,30 @@ api.post('/attendance/lateness/recompute', requireRole('ADMIN'), wrap(async (req
 
 // ---- XonTel link (admin) ---------------------------------------------------
 
-// Set (or clear, with an empty url) the XonTel address. Checked before it is
-// kept: the address must answer the status route the way XonTel does — 401
-// without a token, or 200 — so a typo or a dead tunnel is refused at once.
-// For the new server the address ends in /pbx (…trycloudflare.com/pbx).
+// An address is only kept after it answers the way XonTel does (401 without a
+// token, or 200 on the status route), so a typo or a dead tunnel is refused at
+// once. For the new server the address ends in /pbx.
+async function xontelCheckAddress(raw) {
+  if (!/^https:\/\/[A-Za-z0-9.\-]+(:[0-9]+)?(\/[A-Za-z0-9._\-\/]*)?$/.test(raw)) {
+    return 'Use the full https:// address, e.g. https://name.trycloudflare.com/pbx';
+  }
+  let status = 0;
+  try {
+    const r = await fetch(`${raw}/api/v1/account/agentstatus`, { signal: AbortSignal.timeout(15000), headers: { 'User-Agent': 'Mozilla/5.0 Swipr' } });
+    status = r.status;
+  } catch (e) {
+    return `That address does not answer: ${e.cause?.code || e.message}`;
+  }
+  if (status !== 401 && status !== 200) return `That address answered ${status}, not like XonTel. For the new server it must end in /pbx.`;
+  return null;
+}
+
+// Set (or clear, with an empty url) the XonTel address from the Attendance panel.
 api.put('/xontel/base-url', requireRole('ADMIN'), wrap(async (req, res) => {
   const raw = String(req.body?.url ?? '').trim().replace(/\/+$/, '');
-  if (raw && !/^https:\/\/[A-Za-z0-9.\-]+(:[0-9]+)?(\/[A-Za-z0-9._\-\/]*)?$/.test(raw)) {
-    return res.status(400).json({ error: 'Use the full https:// address, e.g. https://name.trycloudflare.com/pbx' });
-  }
   if (raw) {
-    let status = 0;
-    try {
-      const r = await fetch(`${raw}/api/v1/account/agentstatus`, { signal: AbortSignal.timeout(15000), headers: { 'User-Agent': 'Mozilla/5.0 Swipr' } });
-      status = r.status;
-    } catch (e) {
-      return res.status(400).json({ error: `That address does not answer: ${e.cause?.code || e.message}` });
-    }
-    if (status !== 401 && status !== 200) {
-      return res.status(400).json({ error: `That address answered ${status}, not like XonTel. For the new server it must end in /pbx.` });
-    }
+    const why = await xontelCheckAddress(raw);
+    if (why) return res.status(400).json({ error: why });
   }
   xontelPinnedUrl = raw || null;
   await xontelSaveState({ pinnedBaseUrl: xontelPinnedUrl, pinnedAt: Date.now(), pinnedBy: req.user.id });
