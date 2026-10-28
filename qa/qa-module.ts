@@ -596,6 +596,18 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
     };
 
     /**
+     * Team filter for a TL. A TL is linked to agents through tl_id; when the TL's Quality profile also lists
+     * allowed_departments (a team shared between several TLs, e.g. Complain) every agent of those departments is
+     * theirs too. tlCol is the column holding the agent's TL, deptCol the agent's department (a column or a subquery).
+     */
+    const tlTeamFilter = async (userId: any, tlCol: string, deptCol: string): Promise<{ clause: string; params: any[] }> => {
+      const u = await db.prepare("SELECT allowed_departments FROM users WHERE id = ?").get(userId) as any;
+      const depts = parseScopeColumn(u?.allowed_departments) || [];
+      if (!depts.length) return { clause: `${tlCol} = ?`, params: [userId] };
+      return { clause: `(${tlCol} = ? OR ${deptCol} IN (${depts.map(() => '?').join(',')}))`, params: [userId, ...depts] };
+    };
+
+    /**
      * Returns a SQL snippet + params that restricts an evaluations query to
      * the caller's allowed scope. `aliases.e` is the evaluations table alias
      * and `aliases.agentJoin` is the joined users table alias (for QA's
@@ -958,8 +970,9 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
       if (role === 'tl') {
         const tlBrands = await getTLBrandScope(user_id);
         if (tlBrands === null) {
-          baseQuery += " AND a.tl_id = ?";
-          params.push(user_id);
+          const tf = await tlTeamFilter(user_id, 'a.tl_id', 'a.department');
+          baseQuery += ` AND ${tf.clause}`;
+          params.push(...tf.params);
         }
       }
       // supervisor: no additional filter — they see every evaluation in every state.
@@ -2443,8 +2456,9 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
           query += " WHERE c.agent_id = ?";
           params.push(user_id);
         } else if (role === 'tl') {
-          query += " WHERE c.tl_id = ?";
-          params.push(user_id);
+          const tf = await tlTeamFilter(user_id, 'c.tl_id', '(SELECT department FROM users WHERE id = c.agent_id)');
+          query += ` WHERE ${tf.clause}`;
+          params.push(...tf.params);
         }
         // Supervisors see all
 
@@ -2620,8 +2634,9 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
           query += " AND cr.agent_id = ?";
           params.push(user_id);
         } else if (role === 'tl') {
-          query += " AND cr.tl_id = ?";
-          params.push(user_id);
+          const tf = await tlTeamFilter(user_id, 'cr.tl_id', '(SELECT department FROM users WHERE id = cr.agent_id)');
+          query += ` AND ${tf.clause}`;
+          params.push(...tf.params);
         }
         // qa / supervisor: unrestricted
 
@@ -2780,10 +2795,12 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
       // via the qaScope clause above, so a TL with both team links AND
       // assigned brands sees the intersection.
       if (role === 'tl') {
-        agentsQuery += " AND tl_id = ?";
-        agentsParams.push(callerId);
-        evalsQuery += " AND a.tl_id = ?";
-        evalsParams.push(callerId);
+        const ta = await tlTeamFilter(callerId, 'tl_id', 'department');
+        agentsQuery += ` AND ${ta.clause}`;
+        agentsParams.push(...ta.params);
+        const te = await tlTeamFilter(callerId, 'a.tl_id', 'a.department');
+        evalsQuery += ` AND ${te.clause}`;
+        evalsParams.push(...te.params);
       }
       if (role === 'qa') {
         const scope = await getQAScope(callerId);
@@ -2881,8 +2898,9 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
         if (role === 'tl') {
           const tlBrands = await getTLBrandScope(user_id);
           if (tlBrands === null) {
-            evalsQuery += " AND a.tl_id = ?";
-            params.push(user_id);
+            const tf = await tlTeamFilter(user_id, 'a.tl_id', 'a.department');
+            evalsQuery += ` AND ${tf.clause}`;
+            params.push(...tf.params);
           }
         }
         if (role === 'qa') {
@@ -3137,8 +3155,9 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
         if (role === 'tl') {
           const tlBrands = await getTLBrandScope(user_id);
           if (tlBrands === null) {
-            evalsQuery += " AND a.tl_id = ?";
-            params.push(user_id);
+            const tf = await tlTeamFilter(user_id, 'a.tl_id', 'a.department');
+            evalsQuery += ` AND ${tf.clause}`;
+            params.push(...tf.params);
           }
         }
 
