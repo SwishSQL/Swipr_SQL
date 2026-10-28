@@ -73,6 +73,8 @@ const CAST_TYPES = { int: 'INT', integer: 'INT', bigint: 'BIGINT', numeric: 'FLO
 export function convertCasts(sql) {
   // 1) parameter casts: @p3::jsonb / ::text / ::bigint ...
   let out = sql.replace(/(@p\d+)::(?:jsonb|json|text|int|integer|bigint|numeric|boolean|float)\b/gi, '$1');
+  // a string literal cast to json(b) is already the JSON text SQL Server stores
+  out = out.replace(/('(?:[^']|'')*')::(?:jsonb|json)\b/gi, '$1');
   // 2) anything else: find the operand to the left (a balanced (...) with an optional function name, or a plain token)
   for (let guard = 0; guard < 200; guard++) {
     const m = /::(\w+)(\[\])?/.exec(out);
@@ -153,6 +155,31 @@ export function convertNulls(sql) {
 /** DELETE FROM t alias WHERE ... -> DELETE alias FROM t alias WHERE ... */
 export function convertDeleteAlias(sql) {
   return sql.replace(/^(\s*)DELETE\s+FROM\s+(\w+)\s+(?:AS\s+)?(?!WHERE\b|OUTPUT\b)(\w+)\s+/i, '$1DELETE $3 FROM $2 $3 ');
+}
+
+/** UPDATE t alias SET ... [FROM x] [WHERE ...]  ->  UPDATE alias SET ... FROM t alias[, x] [WHERE ...]  (T-SQL names the alias, not the table) */
+export function convertUpdateAlias(sql) {
+  const m = /^(\s*)UPDATE\s+(\w+)\s+(?:AS\s+)?(?!SET\b)(\w+)\s+SET\s+/i.exec(sql);
+  if (!m || /\bOUTPUT\b/i.test(sql)) return sql;
+  const [, ws, table, alias] = m;
+  const rest = sql.slice(m[0].length);
+  // first top-level FROM / WHERE (outside parens and literals)
+  let depth = 0, from = -1, where = -1;
+  for (let i = 0; i < rest.length; i++) {
+    const ch = rest[i];
+    if (ch === "'") { i++; while (i < rest.length && !(rest[i] === "'" && rest[i + 1] !== "'")) { if (rest[i] === "'") i++; i++; } continue; }
+    if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+    else if (depth === 0) {
+      const tail = rest.slice(i);
+      if (from < 0 && where < 0 && /^FROM\b/i.test(tail) && /\s/.test(rest[i - 1] || ' ')) from = i;
+      else if (where < 0 && /^WHERE\b/i.test(tail) && /\s/.test(rest[i - 1] || ' ')) where = i;
+    }
+  }
+  const set = rest.slice(0, from >= 0 ? from : where >= 0 ? where : rest.length).trimEnd();
+  const fromSrc = from >= 0 ? rest.slice(from + 4, where >= 0 ? where : rest.length).trim() : '';
+  const whereClause = where >= 0 ? ' ' + rest.slice(where) : '';
+  return `${ws}UPDATE ${alias} SET ${set} FROM ${table} ${alias}${fromSrc ? ', ' + fromSrc : ''}${whereClause}`;
 }
 
 /** RETURNING for plain INSERT / UPDATE / DELETE */
@@ -317,6 +344,7 @@ export function convertAvg(sql) {
 export function convertMisc(sql) {
   return outsideLiterals(sql, (p) => p
     .replace(/\bsubstr\s*\(/gi, 'SUBSTRING(')
+    .replace(/(?<![.\w])length\s*\(/gi, 'LEN(')
     .replace(/\bAS\s+TEXT\b/gi, 'AS NVARCHAR(MAX)')
     .replace(/\s\|\|\s/g, ' + ')
     .replace(/\bROUND\s*\(\s*([^(),]+)\s*\)/gi, 'ROUND($1, 0)'));
@@ -345,6 +373,7 @@ export function translateSql(raw) {
   s = convertBoolLiterals(s);
   s = convertOnConflict(s);
   s = convertReturning(s);
+  s = convertUpdateAlias(s);
   s = convertForUpdate(s);
   s = convertNulls(s);
   s = convertDeleteAlias(s);

@@ -1691,7 +1691,7 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
 const REQUIRED_OBJECTS = [
   'users', 'schedules', 'swap_requests', 'leave_requests', 'public_holidays', 'shift_templates', 'audit_log', 'notifications',
   'evaluations', 'breaks', 'break_freezes', 'overtime_sessions', 'kpi_targets', 'attendance', 'attendance_suppressed',
-  'attendance_daily', 'sync_state', 'xontel_agent_map', 'xontel_sessions', 'xontel_calls', 'xontel_missed_calls',
+  'attendance_daily', 'sync_state', 'xontel_agent_map', 'xontel_sessions', 'xontel_calls', 'xontel_call_waits', 'xontel_aggregator_numbers', 'xontel_queue_map', 'xontel_status_class', 'xontel_missed_calls',
   'xontel_callbacks', 'push_subscriptions', 'fcm_tokens', 'call_logs', 'sick_documents', 'call_recordings', '_migrations',
 ];
 const QA_OBJECTS = ['qa_user_profile', 'qa_users', 'qa_evaluations', 'qa_attendance_records'];
@@ -4699,37 +4699,45 @@ api.get('/agent-kpis/report-config', requireRole(...KPI_ROLES), wrap(async (req,
     pool.query('SELECT number, aggregator, kind, note FROM xontel_aggregator_numbers ORDER BY aggregator, number'),
     pool.query('SELECT queue, brand, issue, note FROM xontel_queue_map ORDER BY brand, issue, queue'),
     pool.query('SELECT status, class FROM xontel_status_class ORDER BY class, status'),
+    // The letter / digit filters below run in JS (the database is SQL Server: no regex operator), so these three
+    // queries return the grouped candidates and the lists are cut afterwards.
     pool.query(
-      `SELECT c.queue, count(DISTINCT coalesce(c.uniqueid, c.id))::int AS calls
+      `SELECT c.queue, count(DISTINCT coalesce(c.uniqueid, c.id)) AS calls
          FROM xontel_calls c
-        WHERE c.start_ts >= $1 AND c.direction = 'Incoming' AND c.queue ~ '[A-Za-z]'
+        WHERE c.start_ts >= $1 AND c.direction = 'Incoming' AND c.queue IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM xontel_queue_map m WHERE lower(m.queue) = lower(c.queue))
-        GROUP BY 1 ORDER BY 2 DESC LIMIT 30`, [since]
+        GROUP BY c.queue ORDER BY calls DESC`, [since]
     ),
     // Callers that look like a company line (a 7-8 digit landline) and ring
     // often but are not in the aggregator list.
     pool.query(
-      `SELECT n AS number, count(DISTINCT cid)::int AS calls FROM (
-          SELECT coalesce(c.uniqueid, c.id) AS cid,
-                 CASE WHEN length(d) > 8 AND d LIKE '965%' THEN substr(d, 4) ELSE d END AS n
-            FROM xontel_calls c, LATERAL (SELECT regexp_replace(regexp_replace(coalesce(c.caller_number, ''), '[^0-9]', '', 'g'), '^00', '') AS d) x
-           WHERE c.start_ts >= $1 AND c.direction = 'Incoming'
-        ) t
-        WHERE n ~ '^(2[0-9]{7}|1[0-9]{6})$'
-          AND NOT EXISTS (SELECT 1 FROM xontel_aggregator_numbers a WHERE a.number = t.n)
-        GROUP BY 1 HAVING count(DISTINCT cid) >= 20 ORDER BY 2 DESC LIMIT 15`, [since]
+      `SELECT c.caller_number, count(DISTINCT coalesce(c.uniqueid, c.id)) AS calls
+         FROM xontel_calls c
+        WHERE c.start_ts >= $1 AND c.direction = 'Incoming' AND c.caller_number IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM xontel_aggregator_numbers a WHERE a.number = c.caller_number)
+        GROUP BY c.caller_number`, [since]
     ),
     pool.query(
-      `SELECT s.status, round(sum(coalesce(s.duration_sec, 0)) / 3600.0)::int AS hours
+      `SELECT s.status, round(sum(coalesce(s.duration_sec, 0)) / 3600.0, 0) AS hours
          FROM xontel_sessions s
         WHERE s.start_ts >= $1 AND NOT EXISTS (SELECT 1 FROM xontel_status_class k WHERE lower(k.status) = lower(s.status))
-        GROUP BY 1 ORDER BY 2 DESC LIMIT 20`, [since]
+        GROUP BY s.status ORDER BY hours DESC`, [since]
     ),
   ]);
+  const unmappedQueues = uq.rows.filter((r) => /[A-Za-z]/.test(r.queue)).slice(0, 30).map((r) => ({ queue: r.queue, calls: Number(r.calls) }));
+  const byNumber = new Map();
+  for (const r of uc.rows) {
+    let d = String(r.caller_number).replace(/[^0-9]/g, '').replace(/^00/, '');
+    if (d.length > 8 && d.startsWith('965')) d = d.slice(3);
+    if (/^(2[0-9]{7}|1[0-9]{6})$/.test(d)) byNumber.set(d, (byNumber.get(d) || 0) + Number(r.calls));
+  }
+  const known = new Set(agg.rows.map((r) => r.number));
+  const unmappedCallers = [...byNumber].filter(([n, c]) => c >= 20 && !known.has(n)).sort((x, y) => y[1] - x[1]).slice(0, 15).map(([number, calls]) => ({ number, calls }));
+  const unmappedStatuses = us.rows.slice(0, 20).map((r) => ({ status: r.status, hours: Math.round(Number(r.hours)) }));
   res.json({
     canEdit: isAdmin(req),
     aggregators: agg.rows, queues: qm.rows, statuses: sc.rows,
-    unmapped: { queues: uq.rows, callers: uc.rows, statuses: us.rows },
+    unmapped: { queues: unmappedQueues, callers: unmappedCallers, statuses: unmappedStatuses },
     classes: REPORT_STATUS_CLASS_NAMES, kinds: REPORT_NUMBER_KINDS,
   });
 }));
@@ -4829,34 +4837,61 @@ api.put('/agent-kpis/report-config', requireRole('ADMIN'), wrap(async (req, res)
 //   AHT (approx) = billsec / answered, which includes that IVR and queue time
 const CALLS_REPORT_MAX_DAYS = 400, CALLS_REPORT_MAX_HOUR_DAYS = 92;
 const CALLS_REPORT_WEEK_STARTS_SUNDAY = true;    // Ops to confirm (question 11)
-const callsPeriodSql = (group) => ({
-  hour: `to_char(date_trunc('hour', lt), 'YYYY-MM-DD HH24:00')`,
-  day: `to_char(lt, 'YYYY-MM-DD')`,
-  week: CALLS_REPORT_WEEK_STARTS_SUNDAY
-    ? `to_char(date_trunc('week', lt + interval '1 day') - interval '1 day', 'YYYY-MM-DD')`
-    : `to_char(date_trunc('week', lt), 'YYYY-MM-DD')`,
-  month: `to_char(lt, 'YYYY-MM')`,
-  quarter: `to_char(lt, 'YYYY-"Q"Q')`,
-  year: `to_char(lt, 'YYYY')`,
-})[group];
-const CALLS_CALLER_NORM = `CASE WHEN length(x.d) > 8 AND x.d LIKE '965%' THEN substr(x.d, 4) ELSE x.d END`;
-const callsCte = (outgoing) => `WITH base AS (
-  SELECT c.start_ts, c.duration_sec, c.talk_sec, c.status, c.connect_ts, c.wait_sec,
-         (to_timestamp(c.start_ts / 1000.0) AT TIME ZONE 'Asia/Kuwait') AS lt,
-         coalesce(m.brand, 'Unmapped') AS brand, coalesce(m.issue, 'Unmapped') AS issue,
-         coalesce(a.aggregator, 'Customer') AS aggregator
+const KUWAIT_OFFSET_MS = 3 * 3600e3;             // Kuwait has no daylight saving, so a fixed shift gives its wall clock
+// SQL Server edition: the database only groups by an integer hour / day index of Kuwait local time; naming the periods
+// (week, month, quarter, year) and merging the buckets is done here, so no date-formatting functions are needed in SQL.
+const callsBucketKey = (group, idx) => {
+  const iso = new Date(Number(idx) * (group === 'hour' ? 3600e3 : 86400e3)).toISOString();
+  const day = iso.slice(0, 10);
+  if (group === 'hour') return `${day} ${iso.slice(11, 13)}:00`;
+  if (group === 'day') return day;
+  if (group === 'month') return day.slice(0, 7);
+  if (group === 'year') return day.slice(0, 4);
+  if (group === 'quarter') return `${day.slice(0, 4)}-Q${Math.floor((Number(day.slice(5, 7)) - 1) / 3) + 1}`;
+  const t = Date.parse(`${day}T00:00:00Z`);
+  const dow = new Date(t).getUTCDay();
+  return new Date(t - (CALLS_REPORT_WEEK_STARTS_SUNDAY ? dow : (dow + 6) % 7) * 86400e3).toISOString().slice(0, 10);
+};
+const CALLS_BUCKET_SQL = (group) => `(start_ts + ${KUWAIT_OFFSET_MS}) / ${group === 'hour' ? 3600000 : 86400000}`;
+const callsCte = (outgoing) => `WITH b0 AS (
+  SELECT c.start_ts, c.duration_sec, c.talk_sec, c.status, c.connect_ts, c.wait_sec, c.queue,
+         regexp_replace(coalesce(c.caller_number, ''), '[^0-9]', '', 'g') AS d0
     FROM xontel_calls c
-    CROSS JOIN LATERAL (SELECT regexp_replace(regexp_replace(coalesce(c.caller_number, ''), '[^0-9]', '', 'g'), '^00', '') AS d) x
-    LEFT JOIN xontel_queue_map m ON lower(m.queue) = lower(c.queue)
-    LEFT JOIN xontel_aggregator_numbers a ON a.number = ${CALLS_CALLER_NORM}
    WHERE c.start_ts >= $1 AND c.start_ts < $2 AND c.xontel_agent_id = ANY($3)
      AND c.direction = '${outgoing ? 'Outgoing' : 'Incoming'}'${outgoing ? '' : " AND c.status = 'Answered'"}
+), b1 AS (
+  SELECT b0.*, CASE WHEN substr(d0, 1, 2) = '00' THEN substr(d0, 3) ELSE d0 END AS d FROM b0
+), base AS (
+  SELECT b1.start_ts, b1.duration_sec, b1.talk_sec, b1.status, b1.connect_ts, b1.wait_sec,
+         coalesce(m.brand, 'Unmapped') AS brand, coalesce(m.issue, 'Unmapped') AS issue,
+         coalesce(a.aggregator, 'Customer') AS aggregator
+    FROM b1
+    LEFT JOIN xontel_queue_map m ON lower(m.queue) = lower(b1.queue)
+    LEFT JOIN xontel_aggregator_numbers a ON a.number = CASE WHEN length(b1.d) > 8 AND b1.d LIKE '965%' THEN substr(b1.d, 4) ELSE b1.d END
 ) `;
-const CALLS_FILTER = `WHERE ($4::text = '' OR brand = $4) AND ($5::text = '' OR issue = $5) AND ($6::text = '' OR aggregator = $6)`;
-const CALLS_STATS = `count(*)::int AS answered, coalesce(sum(talk_sec), 0)::float AS talk,
-  count(wait_sec)::int AS wait_n, coalesce(sum(wait_sec), 0)::float AS wait_sum, coalesce(max(wait_sec), 0)::int AS wait_max,
-  count(connect_ts)::int AS conn_n,
-  coalesce(sum(GREATEST(0, (start_ts + duration_sec * 1000 - connect_ts) / 1000.0)) FILTER (WHERE connect_ts IS NOT NULL), 0)::float AS handle_sum`;
+const CALLS_FILTER = `WHERE ($4 = '' OR brand = $4) AND ($5 = '' OR issue = $5) AND ($6 = '' OR aggregator = $6)`;
+const CALLS_STATS = `count(*) AS answered, coalesce(sum(CAST(talk_sec AS BIGINT)), 0) AS talk,
+  count(wait_sec) AS wait_n, coalesce(sum(CAST(wait_sec AS BIGINT)), 0) AS wait_sum, coalesce(max(wait_sec), 0) AS wait_max,
+  count(connect_ts) AS conn_n,
+  coalesce(sum(CASE WHEN connect_ts IS NULL THEN NULL WHEN start_ts + duration_sec * 1000 - connect_ts > 0 THEN (start_ts + duration_sec * 1000 - connect_ts) / 1000.0 ELSE 0 END), 0) AS handle_sum,
+  count(CASE WHEN wait_sec < 10 THEN 1 END) AS b1, count(CASE WHEN wait_sec >= 10 AND wait_sec < 20 THEN 1 END) AS b2,
+  count(CASE WHEN wait_sec >= 20 AND wait_sec < 30 THEN 1 END) AS b3, count(CASE WHEN wait_sec >= 30 THEN 1 END) AS b4`;
+const CALLS_STAT_KEYS = ['answered', 'talk', 'wait_n', 'wait_sum', 'conn_n', 'handle_sum', 'b1', 'b2', 'b3', 'b4'];
+// Adds up rows of CALLS_STATS (the database counts are bigint-safe strings) into one record.
+const sumCallStats = (rows) => {
+  const out = { wait_max: 0 };
+  for (const k of CALLS_STAT_KEYS) out[k] = 0;
+  for (const r of rows) {
+    for (const k of CALLS_STAT_KEYS) out[k] += Number(r[k]) || 0;
+    out.wait_max = Math.max(out.wait_max, Number(r.wait_max) || 0);
+  }
+  return out;
+};
+const groupCallStats = (rows, keyOf) => {
+  const g = new Map();
+  for (const r of rows) { const k = keyOf(r); if (!g.has(k)) g.set(k, []); g.get(k).push(r); }
+  return g;
+};
 
 api.get('/agent-kpis/calls-report', requireRole(...KPI_ROLES), wrap(async (req, res) => {
   const today = dayKeyInAppTz(Date.now());
@@ -4876,23 +4911,18 @@ api.get('/agent-kpis/calls-report', requireRole(...KPI_ROLES), wrap(async (req, 
   const cc = agents.filter((a) => nrm(a.user.companyName) === 'call center');
   const ids = cc.map((a) => a.agentId);
   const P = [lo, hi, ids, brand, issue, aggregator];
-  const per = callsPeriodSql(group);
-  const [tot, series, byBi, byAgg, outTot, outSeries, outByStatus, opts, other, first] = await Promise.all([
-    pool.query(`${callsCte(false)} SELECT ${CALLS_STATS},
-        count(*) FILTER (WHERE wait_sec < 10)::int AS b1, count(*) FILTER (WHERE wait_sec >= 10 AND wait_sec < 20)::int AS b2,
-        count(*) FILTER (WHERE wait_sec >= 20 AND wait_sec < 30)::int AS b3, count(*) FILTER (WHERE wait_sec >= 30)::int AS b4
-        FROM base ${CALLS_FILTER}`, P),
-    pool.query(`${callsCte(false)} SELECT ${per} AS k, ${CALLS_STATS} FROM base ${CALLS_FILTER} GROUP BY 1 ORDER BY 1`, P),
-    pool.query(`${callsCte(false)} SELECT brand, issue, ${CALLS_STATS} FROM base ${CALLS_FILTER} GROUP BY 1, 2 ORDER BY 3 DESC`, P),
-    pool.query(`${callsCte(false)} SELECT aggregator, ${CALLS_STATS} FROM base ${CALLS_FILTER} GROUP BY 1 ORDER BY 2 DESC`, P),
-    pool.query(`${callsCte(true)} SELECT count(*)::int AS calls, count(*) FILTER (WHERE status = 'Answered')::int AS answered,
-        coalesce(sum(talk_sec) FILTER (WHERE status = 'Answered'), 0)::float AS talk FROM base`, P.slice(0, 3)),
-    pool.query(`${callsCte(true)} SELECT ${per} AS k, count(*)::int AS calls FROM base GROUP BY 1 ORDER BY 1`, P.slice(0, 3)),
-    pool.query(`${callsCte(true)} SELECT status, count(*)::int AS calls, coalesce(sum(talk_sec), 0)::float AS talk FROM base GROUP BY 1 ORDER BY 2 DESC`, P.slice(0, 3)),
+  const grain = group === 'hour' ? 'hour' : 'day';
+  const [fine, outTot, outSeries, outByStatus, opts, other, first] = await Promise.all([
+    pool.query(`${callsCte(false)} SELECT brand, issue, aggregator, ${CALLS_BUCKET_SQL(grain)} AS bucket, ${CALLS_STATS}
+        FROM base ${CALLS_FILTER} GROUP BY brand, issue, aggregator, ${CALLS_BUCKET_SQL(grain)}`, P),
+    pool.query(`${callsCte(true)} SELECT count(*) AS calls, count(CASE WHEN status = 'Answered' THEN 1 END) AS answered,
+        coalesce(sum(CASE WHEN status = 'Answered' THEN CAST(talk_sec AS BIGINT) END), 0) AS talk FROM base`, P.slice(0, 3)),
+    pool.query(`${callsCte(true)} SELECT ${CALLS_BUCKET_SQL(grain)} AS bucket, count(*) AS calls FROM base GROUP BY ${CALLS_BUCKET_SQL(grain)}`, P.slice(0, 3)),
+    pool.query(`${callsCte(true)} SELECT status, count(*) AS calls, coalesce(sum(CAST(talk_sec AS BIGINT)), 0) AS talk FROM base GROUP BY status ORDER BY calls DESC`, P.slice(0, 3)),
     pool.query(`SELECT 'brand' AS t, brand AS v FROM xontel_queue_map UNION SELECT 'issue', issue FROM xontel_queue_map
                 UNION SELECT 'aggregator', aggregator FROM xontel_aggregator_numbers`),
     pool.query(
-      `SELECT count(*)::int AS n FROM xontel_calls WHERE start_ts >= $1 AND start_ts < $2 AND direction = 'Incoming' AND status = 'Answered'
+      `SELECT count(*) AS n FROM xontel_calls WHERE start_ts >= $1 AND start_ts < $2 AND direction = 'Incoming' AND status = 'Answered'
           AND xontel_agent_id IS NOT NULL AND NOT (xontel_agent_id = ANY($3))`, [lo, hi, ids]),
     pool.query('SELECT min(start_ts) AS ts FROM xontel_calls'),
   ]);
@@ -4903,25 +4933,33 @@ api.get('/agent-kpis/calls-report', requireRole(...KPI_ROLES), wrap(async (req, 
     ahtTrueSec: r.conn_n ? Math.round(n(r.handle_sum) / r.conn_n) : null,
     ahtApproxSec: r.answered ? Math.round(n(r.talk) / r.answered) : null,
   });
-  const t = tot.rows[0];
+  const t = sumCallStats(fine.rows);
   const optSet = (k) => [...new Set(opts.rows.filter((r) => r.t === k).map((r) => r.v))].sort((a, b) => a.localeCompare(b));
-  const o = outTot.rows[0];
+  const o = { calls: n(outTot.rows[0].calls), answered: n(outTot.rows[0].answered), talk: n(outTot.rows[0].talk) };
+  const byAnswered = (a, b) => b.answered - a.answered;
+  const series = [...groupCallStats(fine.rows, (r) => callsBucketKey(group, r.bucket))]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([key, rs]) => ({ key, ...stat(sumCallStats(rs)) }));
+  const outPeriods = new Map();
+  for (const r of outSeries.rows) { const k = callsBucketKey(group, r.bucket); outPeriods.set(k, (outPeriods.get(k) || 0) + n(r.calls)); }
   res.json({
     from, to, group, days: Math.round(days),
     callCenterAgents: cc.length,
     dataStart: first.rows[0]?.ts === null || first.rows[0]?.ts === undefined ? null : Number(first.rows[0].ts),
-    otherAgentsAnswered: other.rows[0].n,
+    otherAgentsAnswered: n(other.rows[0].n),
     options: { brands: [...optSet('brand'), 'Unmapped'], issues: [...optSet('issue'), 'Unmapped'], aggregators: [...optSet('aggregator'), 'Customer'] },
     totals: { ...stat(t), waitBuckets: { lt10: t.b1, lt20: t.b2, lt30: t.b3, gte30: t.b4 }, waitCoverage: t.answered ? Math.round((t.wait_n / t.answered) * 100) : null },
-    series: series.rows.map((r) => ({ key: r.k, ...stat(r) })),
-    brands: byBi.rows.map((r) => ({ brand: r.brand, issue: r.issue, ...stat(r) })),
-    aggregators: byAgg.rows.map((r) => ({ aggregator: r.aggregator, ...stat(r) })),
+    series,
+    brands: [...groupCallStats(fine.rows, (r) => `${r.brand}\u0000${r.issue}`)].map(([k, rs]) => {
+      const [b, i] = k.split('\u0000');
+      return { brand: b, issue: i, ...stat(sumCallStats(rs)) };
+    }).sort(byAnswered),
+    aggregators: [...groupCallStats(fine.rows, (r) => r.aggregator)].map(([a, rs]) => ({ aggregator: a, ...stat(sumCallStats(rs)) })).sort(byAnswered),
     outgoing: {
-      calls: o.calls, answered: o.answered, talkSec: Math.round(n(o.talk)),
-      ahtAllSec: o.calls ? Math.round(n(o.talk) / o.calls) : null,            // the email's formula: handle / all outbound calls
-      ahtAnsweredSec: o.answered ? Math.round(n(o.talk) / o.answered) : null,
-      byStatus: outByStatus.rows.map((r) => ({ status: r.status || 'Unknown', calls: r.calls, talkSec: Math.round(n(r.talk)) })),
-      series: outSeries.rows.map((r) => ({ key: r.k, calls: r.calls })),
+      calls: o.calls, answered: o.answered, talkSec: Math.round(o.talk),
+      ahtAllSec: o.calls ? Math.round(o.talk / o.calls) : null,            // the email's formula: handle / all outbound calls
+      ahtAnsweredSec: o.answered ? Math.round(o.talk / o.answered) : null,
+      byStatus: outByStatus.rows.map((r) => ({ status: r.status || 'Unknown', calls: n(r.calls), talkSec: Math.round(n(r.talk)) })),
+      series: [...outPeriods].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([key, calls]) => ({ key, calls })),
     },
   });
 }));

@@ -684,12 +684,18 @@ CREATE TABLE dbo.[xontel_calls] (
   [start_ts] BIGINT NOT NULL,
   [duration_sec] INT NOT NULL DEFAULT 0,
   [talk_sec] INT NOT NULL DEFAULT 0,
-  [direction] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NULL,
+  [direction] NVARCHAR(450) COLLATE Latin1_General_100_BIN2 NULL,
   [status] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NULL,
-  [caller_number] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NULL,
+  [caller_number] NVARCHAR(450) COLLATE Latin1_General_100_BIN2 NULL,
   [queue] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NULL,
   [recording_url] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NULL,
   [fetched_at] BIGINT NOT NULL,
+  [uniqueid] NVARCHAR(450) COLLATE Latin1_General_100_BIN2 NULL,
+  [did] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NULL,
+  [raw] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NULL,
+  [connect_ts] BIGINT NULL,
+  [wait_sec] INT NULL,
+  CONSTRAINT [ck_xontel_calls_raw_json] CHECK (ISJSON([raw]) = 1),
   CONSTRAINT [pk_xontel_calls] PRIMARY KEY ([id])
 );
 GO
@@ -698,6 +704,76 @@ CREATE INDEX [xontel_calls_agent_idx] ON dbo.[xontel_calls] ([xontel_agent_id], 
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'xontel_calls_start_idx' AND object_id = OBJECT_ID(N'dbo.xontel_calls'))
 CREATE INDEX [xontel_calls_start_idx] ON dbo.[xontel_calls] ([start_ts]);
+GO
+IF COL_LENGTH(N'dbo.xontel_calls', N'uniqueid') IS NULL ALTER TABLE dbo.[xontel_calls] ADD [uniqueid] NVARCHAR(450) COLLATE Latin1_General_100_BIN2 NULL;
+GO
+IF COL_LENGTH(N'dbo.xontel_calls', N'did') IS NULL ALTER TABLE dbo.[xontel_calls] ADD [did] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NULL;
+GO
+IF COL_LENGTH(N'dbo.xontel_calls', N'raw') IS NULL ALTER TABLE dbo.[xontel_calls] ADD [raw] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NULL;
+GO
+IF COL_LENGTH(N'dbo.xontel_calls', N'connect_ts') IS NULL ALTER TABLE dbo.[xontel_calls] ADD [connect_ts] BIGINT NULL;
+GO
+IF COL_LENGTH(N'dbo.xontel_calls', N'wait_sec') IS NULL ALTER TABLE dbo.[xontel_calls] ADD [wait_sec] INT NULL;
+GO
+IF COL_LENGTH(N'dbo.xontel_calls', N'direction') = -1 ALTER TABLE dbo.[xontel_calls] ALTER COLUMN [direction] NVARCHAR(450) COLLATE Latin1_General_100_BIN2 NULL;
+GO
+IF COL_LENGTH(N'dbo.xontel_calls', N'caller_number') = -1 ALTER TABLE dbo.[xontel_calls] ALTER COLUMN [caller_number] NVARCHAR(450) COLLATE Latin1_General_100_BIN2 NULL;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'xontel_calls_uniqueid_idx' AND object_id = OBJECT_ID(N'dbo.xontel_calls'))
+CREATE INDEX [xontel_calls_uniqueid_idx] ON dbo.[xontel_calls] ([uniqueid]);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'xontel_calls_dir_start_idx' AND object_id = OBJECT_ID(N'dbo.xontel_calls'))
+CREATE INDEX [xontel_calls_dir_start_idx] ON dbo.[xontel_calls] ([direction], [start_ts]);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'xontel_calls_caller_idx' AND object_id = OBJECT_ID(N'dbo.xontel_calls'))
+CREATE INDEX [xontel_calls_caller_idx] ON dbo.[xontel_calls] ([caller_number]);
+GO
+IF OBJECT_ID(N'dbo.xontel_call_waits', N'U') IS NULL
+CREATE TABLE dbo.[xontel_call_waits] (
+  [id] NVARCHAR(450) COLLATE Latin1_General_100_BIN2 NOT NULL,
+  [day] NVARCHAR(450) COLLATE Latin1_General_100_BIN2 NOT NULL,
+  [queue] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NULL,
+  [agent] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NULL,
+  [caller] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NULL,
+  [connect_ts] BIGINT NOT NULL,
+  [wait_sec] INT NOT NULL,
+  [fetched_at] BIGINT NOT NULL,
+  CONSTRAINT [pk_xontel_call_waits] PRIMARY KEY ([id])
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'xontel_call_waits_day_idx' AND object_id = OBJECT_ID(N'dbo.xontel_call_waits'))
+CREATE INDEX [xontel_call_waits_day_idx] ON dbo.[xontel_call_waits] ([day]);
+GO
+IF OBJECT_ID(N'dbo.xontel_aggregator_numbers', N'U') IS NULL
+CREATE TABLE dbo.[xontel_aggregator_numbers] (
+  [number] NVARCHAR(450) COLLATE Latin1_General_100_BIN2 NOT NULL,
+  [aggregator] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NOT NULL,
+  [kind] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NOT NULL DEFAULT N'caller',
+  [note] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NULL,
+  [updated_by] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NULL,
+  [updated_at] BIGINT NOT NULL,
+  CONSTRAINT [pk_xontel_aggregator_numbers] PRIMARY KEY ([number])
+);
+GO
+IF OBJECT_ID(N'dbo.xontel_queue_map', N'U') IS NULL
+CREATE TABLE dbo.[xontel_queue_map] (
+  [queue] NVARCHAR(450) COLLATE Latin1_General_100_BIN2 NOT NULL,
+  [brand] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NOT NULL,
+  [issue] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NOT NULL,
+  [note] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NULL,
+  [updated_by] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NULL,
+  [updated_at] BIGINT NOT NULL,
+  CONSTRAINT [pk_xontel_queue_map] PRIMARY KEY ([queue])
+);
+GO
+IF OBJECT_ID(N'dbo.xontel_status_class', N'U') IS NULL
+CREATE TABLE dbo.[xontel_status_class] (
+  [status] NVARCHAR(450) COLLATE Latin1_General_100_BIN2 NOT NULL,
+  [class] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NOT NULL,
+  [updated_by] NVARCHAR(MAX) COLLATE Latin1_General_100_BIN2 NULL,
+  [updated_at] BIGINT NOT NULL,
+  CONSTRAINT [pk_xontel_status_class] PRIMARY KEY ([status])
+);
 GO
 IF OBJECT_ID(N'dbo.xontel_missed_calls', N'U') IS NULL
 CREATE TABLE dbo.[xontel_missed_calls] (
