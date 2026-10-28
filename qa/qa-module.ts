@@ -607,6 +607,71 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
       return { clause: `(${tlCol} = ? OR ${deptCol} IN (${depts.map(() => '?').join(',')}))`, params: [userId, ...depts] };
     };
 
+    // ---- QA functions ("teams"): Customer Care (Swish), Complaint Team (Complain), Technical Team (TEC) -------------
+    // An evaluation carries the team of its agent at the time it was logged (evaluations.team, backfilled from the
+    // agent's department). Lists and reports show ONE team at a time: the browser names it in the X-QA-Team header and
+    // the server accepts only a team the caller may see (allowed_departments; agents and TLs: their own department).
+    const ALL_TEAMS = ['Swish', 'Complain', 'TEC'];
+    const TEAM_LABELS: Record<string, string> = { Swish: 'Customer Care', Complain: 'Complaint Team', TEC: 'Technical Team' };
+    const teamOfDepartment = (d: any): string => {
+      const v = String(d || '').trim().toLowerCase();
+      return v.startsWith('tec') ? 'TEC' : v.startsWith('compl') ? 'Complain' : 'Swish';
+    };
+    // the same mapping in SQL, for a department column or a (subquery)
+    const teamExpr = (col: string) => `(CASE WHEN LOWER(${col}) LIKE 'tec%' THEN 'TEC' WHEN LOWER(${col}) LIKE 'compl%' THEN 'Complain' ELSE 'Swish' END)`;
+    const allowedTeamsFor = (u: any): string[] => {
+      const own = teamOfDepartment(u?.department);
+      const listed = (parseScopeColumn(u?.allowed_departments) || []).map(teamOfDepartment);
+      const pick = (a: string[]) => ALL_TEAMS.filter(t => a.includes(t));
+      if (u?.role === 'agent') return [own];
+      if (u?.role === 'tl') return pick([own, ...listed]);
+      if (u?.role === 'qa') return listed.length ? pick(listed) : [own];
+      return listed.length ? pick(listed) : [...ALL_TEAMS];   // supervisor / cc_supervisor / compliance: a list restricts, none = every team
+    };
+    const currentTeam = (req: any): { team: string; allowed: string[] } => {
+      const allowed = allowedTeamsFor(req.qaUser);
+      const asked = String((req.get && req.get('x-qa-team')) || req.query?.team || '').trim();
+      return { team: allowed.includes(asked) ? asked : allowed[0], allowed };
+    };
+    const teamOfAgent = async (agentId: any): Promise<string> => {
+      const a = await db.prepare("SELECT department FROM users WHERE id = ?").get(agentId) as any;
+      return teamOfDepartment(a?.department);
+    };
+    // Call types a team may log: form_settings rows of field_type 'team_call_type' whose value is 'Team|Call type'.
+    // A team with no rows (Customer Care) uses every active call type.
+    const teamCallTypes = async (team: string): Promise<string[] | null> => {
+      const rows = await db.prepare("SELECT value FROM form_settings WHERE field_type = 'team_call_type' AND is_active = 1").all() as any[];
+      const mine = rows.map((r: any) => String(r.value).split('|')).filter((p: string[]) => p.length === 2 && teamOfDepartment(p[0]) === team).map((p: string[]) => p[1].trim());
+      return mine.length ? mine : null;
+    };
+    // One-time seed (Oct 2026): the Technical Team scorecard from the Ops draft, its call type and the per-team call types.
+    const seedTeamsV1 = async () => {
+      const done = await db.prepare("SELECT 1 FROM form_settings WHERE field_type = '_meta' AND value = 'teams_v1_2026_10'").get();
+      if (done) return;
+      const ins = (field_type: string, label_en: string, value: string, sort_order: number) =>
+        db.prepare("INSERT INTO form_settings (field_type, label_en, label_ar, value, is_active, sort_order) VALUES (?, ?, NULL, ?, 1, ?)").run(field_type, label_en, value, sort_order);
+      await ins('call_type', 'Technical Call', 'Technical Call', 50);
+      await ins('team_call_type', 'Complaints', 'Complain|Complaints', 1);
+      await ins('team_call_type', 'Technical Call', 'TEC|Technical Call', 2);
+      await ins('eval_section', 'TECHNICAL TEAM SCORECARD', 'technical', 50);
+      const TEC_CARD: Array<[string, number, string, string, string, string]> = [
+        ['Information Accuracy & Communication', 25, 'CTS', "Understands, verifies and communicates the request accurately and completely.", 'Understands the request correctly and communicates accurate, complete information.', 'Communicates incorrect, incomplete or misleading information.'],
+        ['Database & System Accuracy', 20, 'CTB', 'Creates and updates the assigned database / system records correctly.', 'Enters the correct information, completes the required fields and verifies the entry.', 'Enters incorrect or incomplete information or fails to save a required update.'],
+        ['Order Identification & Verification', 15, 'CTS', 'Identifies the correct order and verifies its details before acting.', 'Identifies the correct order and verifies the available details before acting.', 'Acts on the wrong order, confuses order details or skips a required verification.'],
+        ['Aggregator Coordination & Follow-up', 15, 'CTS', 'Coordinates with the aggregators, communicates the request clearly and follows up.', 'Contacts the appropriate aggregator, communicates the request clearly and follows up.', 'Fails to contact the aggregator when required or communicates the request unclearly.'],
+        ['Customer Communication & Handling', 10, 'CTC', 'Communicates professionally, clearly and accurately with the customer.', 'Uses professional language, gives accurate information and follows the communication standards.', 'Communicates misleading information, behaves unprofessionally or misses the customer need.'],
+        ['SLA Compliance - Process Initiation', 10, 'CTS', 'Initiates the required action within 3 minutes of receiving the task.', 'Initiates the required action within 3 minutes, or has a valid documented reason.', 'Initiates the action after 3 minutes without a valid reason or approval.'],
+        ['SOP Compliance & Process Adherence', 5, 'CTS', 'Follows the approved procedures and required steps.', 'Follows the applicable SOP, uses the correct channel and completes the required steps.', 'Skips a required step, uses an incorrect process or violates an applicable SOP.'],
+      ];
+      let i = 0;
+      for (const [label, weight, category, definition, pass, fail] of TEC_CARD) {
+        await ins('eval_question', label, JSON.stringify({ section: 'technical', weight, critical: false, category, teams: ['TEC'], call_types: ['Technical Call'], weights_by_type: { 'Technical Call': weight }, definition, pass, fail }), 100 + i++);
+      }
+      await ins('_meta', 'QA teams v1: Technical Team scorecard, team call types', 'teams_v1_2026_10', 0);
+      console.log('[qa] teams v1 seeded: Technical Team scorecard (7 questions), team call types');
+    };
+    await seedTeamsV1();
+
     /**
      * Returns a SQL snippet + params that restricts an evaluations query to
      * the caller's allowed scope. `aliases.e` is the evaluations table alias
@@ -885,6 +950,14 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
     });
 
     // Users Management
+    // Which team the caller is looking at, which ones they may switch to, and each team's call types (null = every active type).
+    app.get("/teams", async (req: any, res) => {
+      const { team, allowed } = currentTeam(req);
+      const call_types: Record<string, string[] | null> = {};
+      for (const t of allowed) call_types[t] = await teamCallTypes(t);
+      res.json({ current: team, allowed, labels: TEAM_LABELS, call_types });
+    });
+
     app.get("/users", async (req, res) => {
       const users = await db.prepare(
         "SELECT id, display_name, username, role, department, tl_id, cc_supervisor_id, allowed_departments, allowed_brands FROM users"
@@ -963,6 +1036,7 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
       const qaScope = await buildQAScopeClause(user_id, role, { e: 'e', agentJoin: 'a' });
       baseQuery += qaScope.clause;
       params.push(...qaScope.params);
+      if (role !== 'agent') { baseQuery += " AND e.team = ?"; params.push(currentTeam(req).team); }
 
       // Legacy fallback: a TL with no brand list configured used to be
       // limited to a.tl_id = self. Keep that for backwards-compat so an
@@ -1618,6 +1692,13 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
       // sent — prevents the "MISHMASH vs Mishmash" split at the source.
       const brand = await canonicalOptionValue('brand', req.body.brand);
       const call_type = await canonicalOptionValue('call_type', req.body.call_type);
+      const team = await teamOfAgent(agent_id);
+      {
+        const allowedTypes = await teamCallTypes(team);
+        if (allowedTypes && call_type && !allowedTypes.includes(String(call_type))) {
+          return res.status(400).json({ error: `"${call_type}" is not a call type of the ${TEAM_LABELS[team] || team} scorecard.` });
+        }
+      }
 
       // Workflow rule: every evaluation goes straight to the Agent regardless
       // of score. There is no TL pre-approval stage anymore — instead, the TL
@@ -1626,8 +1707,8 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
 
       let result;
       try {
-        result = await db.prepare("INSERT INTO evaluations (date, agent_id, qa_id, brand, call_type, final_score, critical_failure, data, status, is_wow, client_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)")
-          .run(date, agent_id, qa_id, brand, call_type, final_score, critical_failure ? 1 : 0, JSON.stringify(data), status, is_wow ? 1 : 0, client_key || null);
+        result = await db.prepare("INSERT INTO evaluations (date, agent_id, qa_id, brand, call_type, final_score, critical_failure, data, status, is_wow, client_key, team, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)")
+          .run(date, agent_id, qa_id, brand, call_type, final_score, critical_failure ? 1 : 0, JSON.stringify(data), status, is_wow ? 1 : 0, client_key || null, team);
       } catch (err: any) {
         // Unique-index race: two simultaneous submits with the same key —
         // the second lands here; hand back the row the first one created.
@@ -1687,6 +1768,7 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
       // Same canonical-casing guarantee as on create.
       const brand = await canonicalOptionValue('brand', req.body.brand);
       const call_type = await canonicalOptionValue('call_type', req.body.call_type);
+      const team = await teamOfAgent(agent_id);
 
       // Snapshot the row before the update so we can diff it for the QA edit
       // trail (who changed what, when). Skipped silently if the row vanished.
@@ -1714,9 +1796,9 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
       await db.prepare(`
         UPDATE evaluations
         SET date = ?, agent_id = ?, qa_id = ?, brand = ?, call_type = ?,
-            final_score = ?, critical_failure = ?, data = ?, status = ?, is_wow = ?
+            final_score = ?, critical_failure = ?, data = ?, status = ?, is_wow = ?, team = ?
         WHERE id = ?
-      `).run(date, agent_id, qa_id, brand, call_type, final_score, critical_failure ? 1 : 0, JSON.stringify(data), newStatus, is_wow ? 1 : 0, evaluation_id);
+      `).run(date, agent_id, qa_id, brand, call_type, final_score, critical_failure ? 1 : 0, JSON.stringify(data), newStatus, is_wow ? 1 : 0, team, evaluation_id);
 
       // Record a field-level edit entry when an editor is identified and
       // something actually changed. Resolves question IDs to labels so the
@@ -2462,6 +2544,7 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
         }
         // Supervisors see all
 
+        query += (/\sWHERE\s/.test(query) ? " AND " : " WHERE ") + teamExpr('(SELECT department FROM users WHERE id = c.agent_id)') + " = '" + currentTeam(req).team + "'";
         const sessions = await db.prepare(query + " ORDER BY c.created_at DESC").all(...params);
         res.json(sessions);
       } catch (e: any) {
@@ -2639,6 +2722,7 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
           params.push(...tf.params);
         }
         // qa / supervisor: unrestricted
+        query += " AND " + teamExpr('a.department') + " = '" + currentTeam(req).team + "'";
 
         if (status && status !== 'all') {
           query += " AND cr.status = ?";
@@ -2788,6 +2872,7 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
       const qaScope = await buildQAScopeClause(callerId, role, { e: 'e', agentJoin: 'a' });
       evalsQuery += qaScope.clause;
       evalsParams.push(...qaScope.params);
+      { const t = currentTeam(req).team; evalsQuery += " AND e.team = ?"; evalsParams.push(t); agentsQuery += " AND " + teamExpr('department') + " = '" + t + "'"; }
 
       // TL Team Overview is ALWAYS strictly team-based — we filter both
       // the agent roster and the evaluation list down to agents whose
@@ -2882,6 +2967,7 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
         const qaScope = await buildQAScopeClause(user_id, role, { e: 'e', agentJoin: 'a' });
         evalsQuery += qaScope.clause;
         params.push(...qaScope.params);
+        { const t = currentTeam(req).team; evalsQuery += " AND e.team = ?"; params.push(t); agentsQuery += " AND " + teamExpr('department') + " = '" + t + "'"; }
 
         // Agents see only their own numbers on the LOB Performance Hub —
         // the page lists every agent's evaluations by default, which leaks
@@ -3016,6 +3102,7 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
         // QA scope clause (which starts with " AND …") composes cleanly.
         const whereParams: any[] = [];
         let whereClause = "WHERE 1=1";
+        whereClause += " AND e.team = ?"; whereParams.push(currentTeam(req).team);
         if (effectiveFrom) { whereClause += " AND e.date >= ?"; whereParams.push(effectiveFrom); }
         if (effectiveTo) { whereClause += " AND e.date <= ?"; whereParams.push(effectiveTo); }
         if (agent_id && agent_id !== 'all') {
@@ -3135,6 +3222,7 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
         const qaScope = await buildQAScopeClause(user_id, role, { e: 'e', agentJoin: 'a' });
         evalsQuery += qaScope.clause;
         params.push(...qaScope.params);
+        { const t = currentTeam(req).team; evalsQuery += " AND e.team = ?"; params.push(t); agentsQuery += " AND " + teamExpr('department') + " = '" + t + "'"; }
 
         let agentParams: any[] = [];
         if (role === 'qa') {
@@ -3329,7 +3417,7 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
         // the string params — created_at::date is a DATE type and the driver
         // binds params as text, so a bare `date >= text` comparison errors.
         // Lexicographic text comparison of YYYY-MM-DD equals chronological order.
-        const dateJoinConds: string[] = ["e.qa_id = u.id"];
+        const dateJoinConds: string[] = ["e.qa_id = u.id", "e.team = '" + currentTeam(req).team + "'"];
         const joinParams: any[] = [];
         if (start_date) {
           dateJoinConds.push("e.created_at::date::text >= ?");
@@ -3462,6 +3550,7 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
                  LEFT JOIN users tl ON c.tl_id = tl.id
                  WHERE 1=1`;
         const params: any[] = [];
+        q += " AND (c.evaluation_id IS NULL OR EXISTS (SELECT 1 FROM evaluations te WHERE te.id = c.evaluation_id AND te.team = ?))"; params.push(currentTeam(req).team);
         if (qa_id) { q += " AND c.qa_id = ?"; params.push(qa_id); }
         if (tl_id) { q += " AND c.tl_id = ?"; params.push(tl_id); }
         if (status && status !== 'all') { q += " AND c.status = ?"; params.push(status); }
@@ -4284,6 +4373,7 @@ export async function buildQaRoutes(db: any): Promise<express.Router> {
         const qaScope = await buildQAScopeClause(user_id, role, { e: 'e', agentJoin: 'a' });
         query += qaScope.clause;
         params.push(...qaScope.params);
+        query += " AND e.team = ?"; params.push(currentTeam(req).team);
 
         if (start_date) {
           query += " AND e.date >= ?";

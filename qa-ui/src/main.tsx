@@ -29,6 +29,14 @@ const customFetch = async function (input: any, init: any) {
     }
   }
 
+  // The team (QA function) being viewed — chosen in the header's TeamSwitcher; the server accepts only an allowed one.
+  try {
+    const team = localStorage.getItem('qa_team');
+    if (team) (headers as any)['X-QA-Team'] = team;
+  } catch (e) {
+    // storage unavailable: the server falls back to the person's first team
+  }
+
   newInit.headers = headers;
   return originalFetch(input, newInit);
 };

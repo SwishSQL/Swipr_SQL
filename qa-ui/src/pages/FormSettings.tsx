@@ -22,6 +22,8 @@ const FIELD_GROUPS = [
   { id: 'call_direction', label: 'Call Directions', icon: PhoneForwarded, color: 'text-emerald-400' },
   { id: 'call_category', label: 'Call Categories', icon: MessageSquare, color: 'text-rose-400' },
   { id: 'call_type', label: 'Call Types', icon: LayoutGrid, color: 'text-amber-400' },
+  // value = "Team|Call type" (teams: Swish = Customer Care, Complain, TEC). A team with no rows uses every call type.
+  { id: 'team_call_type', label: 'Team Call Types (value = Team|Call type)', icon: LayoutGrid, color: 'text-teal-400' },
   { id: 'agent', label: 'Agent Management', icon: UserPlus, color: 'text-sky-400' },
   { id: 'eval_section', label: 'Evaluation Sections', icon: ListChecks, color: 'text-purple-400' },
   { id: 'eval_question', label: 'Evaluation Questions', icon: HelpCircle, color: 'text-orange-400' },
@@ -266,6 +268,11 @@ export default function FormSettings() {
                          <div className="px-2 py-0.5 bg-rose-500/5 dark:bg-rose-500/10 border border-rose-500/10 rounded-lg">
                            <span className="text-[9px] font-black text-rose-600 dark:text-rose-400 italic">
                              -{JSON.parse(q.value).weight}%
+                           </span>
+                         </div>
+                         <div className="px-2 py-0.5 bg-teal-500/5 dark:bg-teal-500/10 border border-teal-500/10 rounded-lg" title="Teams this question belongs to">
+                           <span className="text-[9px] font-black text-teal-600 dark:text-teal-400">
+                             {((JSON.parse(q.value).teams || []).length ? JSON.parse(q.value).teams : ['Swish', 'Complain']).map((t: string) => (t === 'Swish' ? 'CC' : t === 'Complain' ? 'CT' : t)).join(' · ')}
                            </span>
                          </div>
                          <button onClick={() => q.id && handleDelete(q.id)} className="text-zinc-300 group-hover:text-rose-500 transition-colors bg-zinc-50 dark:bg-zinc-800 rounded-md p-1"><X size={10} /></button>

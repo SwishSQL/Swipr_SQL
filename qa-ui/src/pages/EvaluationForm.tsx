@@ -137,6 +137,26 @@ export default function EvaluationForm() {
   // call type has its own attribute list and weights per the QA Manual).
   const [rawSections, setRawSections] = useState<any[]>([]);
   const [rawQuestions, setRawQuestions] = useState<any[]>([]);
+  // The team (QA function) being evaluated — from the header switcher via /api/teams. It decides which agents are
+  // offered, which call types and which scorecard questions (questions without a `teams` list are the shared
+  // Customer Care / Complaint card).
+  const [teamInfo, setTeamInfo] = useState<{ current: string; allowed: string[]; labels: Record<string, string>; call_types: Record<string, string[] | null> } | null>(null);
+  const teamOfDepartment = (d: any): string => {
+    const v = String(d || '').trim().toLowerCase();
+    return v.startsWith('tec') ? 'TEC' : v.startsWith('compl') ? 'Complain' : 'Swish';
+  };
+  const teamQuestionAllowed = (cfg: any, team: string | undefined) => {
+    if (!team) return true;
+    const teams: string[] = Array.isArray(cfg?.teams) && cfg.teams.length ? cfg.teams : ['Swish', 'Complain'];
+    return teams.includes(team);
+  };
+  // New evaluations: keep the call type inside the team's list once it is known.
+  useEffect(() => {
+    const allowed = teamInfo?.call_types?.[teamInfo.current];
+    if (id || !allowed || !allowed.length) return;
+    if (!allowed.includes(formData.call_type)) setFormData((f: any) => ({ ...f, call_type: allowed[0] }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [teamInfo, formData.call_type]);
 
   // Single source of truth for the empty-form shape — used at mount AND
   // when Save-as-Draft wipes the form so the user can start fresh.
@@ -209,6 +229,13 @@ export default function EvaluationForm() {
     call_type: [],
     agent: []
   });
+  // Call types offered for the team being evaluated (a team with no list, Customer Care, gets every active type).
+  const teamCallTypeOptions: any[] = (() => {
+    const allowed = teamInfo?.call_types?.[teamInfo.current];
+    if (!allowed || !allowed.length) return formOptions.call_type;
+    const inTeam = formOptions.call_type.filter((o: any) => allowed.includes(o.value));
+    return inTeam.length ? inTeam : formOptions.call_type;
+  })();
 
   useEffect(() => {
     fetchFormOptions();
@@ -238,6 +265,8 @@ export default function EvaluationForm() {
             if (callTypes.length > 0 && selected && !callTypes.includes(selected)) {
               return null;
             }
+            // Team filter — the Technical Team has its own card; the other questions are the shared CC / Complaint card.
+            if (!teamQuestionAllowed(cfg, teamInfo?.current)) return null;
 
             // Pick the per-call-type weight when available; fall back to
             // the legacy single weight.
@@ -266,8 +295,9 @@ export default function EvaluationForm() {
       })
       .filter((s: any) => s.items.length > 0);
 
-    setFormStructure(structure);
-  }, [rawSections, rawQuestions, formData.call_type]);
+    // a section with no question for this team / call type (e.g. the Technical card outside TEC) is not shown
+    setFormStructure(structure.filter((s: any) => ((s.items || s.questions || []).length > 0)));
+  }, [rawSections, rawQuestions, formData.call_type, teamInfo]);
 
   // Restore a draft if /evaluate?draft=<id> was used.
   useEffect(() => {
@@ -408,19 +438,21 @@ export default function EvaluationForm() {
   const isViewingOnly = id && !isEditMode;
 
   useEffect(() => {
-    fetch('/api/users')
-      .then(res => {
+    Promise.all([fetch('/api/users'), fetch('/api/teams')])
+      .then(async ([res, rt]) => {
         if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
-        return res.json();
-      })
-      .then(data => {
-        // QA scope: filter agents down to those whose department is in the
+        const data = await res.json();
+        const teams = rt.ok ? await rt.json() : null;
+        if (teams) setTeamInfo(teams);
+        // Only the agents of the team being evaluated (header switcher). Editing an old call keeps its agent whatever
+        // the team shown. Then the QA scope: filter agents down to those whose department is in the
         // caller's allowed list. Same tri-state rule as the brand filter:
         // an empty allowed list = unrestricted (legacy or unconfigured),
         // and if filtering wipes out every option we fall back to the full
         // list so the form is never unusable.
         const allowedDeps: string[] = user?.role === 'qa' ? ((user as any).allowed_departments || []) : [];
         let agentsOnly = data.filter((u: UserType) => u.role === 'agent');
+        if (teams?.current && !id) agentsOnly = agentsOnly.filter((u: UserType) => teamOfDepartment(u.department) === teams.current);
         if (user?.role === 'qa' && allowedDeps.length > 0) {
           const scoped = agentsOnly.filter((u: UserType) => allowedDeps.includes(u.department));
           if (scoped.length > 0) agentsOnly = scoped;
@@ -634,7 +666,7 @@ export default function EvaluationForm() {
         brand: formOptions.brand[0]?.value || '',
         call_direction: formOptions.call_direction[0]?.value || '',
         call_category: formOptions.call_category[0]?.value || '',
-        call_type: formOptions.call_type[0]?.value || 'New Order',
+        call_type: teamCallTypeOptions[0]?.value || formOptions.call_type[0]?.value || 'New Order',
       });
       setActiveDraftId(null);
       if (draftIdParam) {
@@ -730,7 +762,7 @@ export default function EvaluationForm() {
             brand: formOptions.brand[0]?.value || '',
             call_direction: formOptions.call_direction[0]?.value || '',
             call_category: formOptions.call_category[0]?.value || '',
-            call_type: formOptions.call_type[0]?.value || 'New Order',
+            call_type: teamCallTypeOptions[0]?.value || formOptions.call_type[0]?.value || 'New Order',
           });
           setActiveDraftId(null);
           if (draftIdParam) navigate('/evaluate', { replace: true });
@@ -1219,7 +1251,7 @@ export default function EvaluationForm() {
               className="w-full bg-white dark:bg-zinc-900 border border-zinc-100 dark:border-zinc-800 rounded-xl px-4 py-3 text-xs text-zinc-800 dark:text-white focus:border-indigo-500 outline-none"
             >
               <option value="">Select Type</option>
-              {formOptions.call_type.map((opt: any) => (
+              {teamCallTypeOptions.map((opt: any) => (
                 <option key={opt.id || opt.value} value={opt.value}>{opt.label}</option>
               ))}
             </select>

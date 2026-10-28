@@ -166,7 +166,7 @@ export default function UserManagement() {
                   <select className={input} value={form.cc_supervisor_id} onChange={e => setForm({ ...form, cc_supervisor_id: e.target.value })}><option value="">— none —</option>{ccs.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select></div>
               )}
             </div>
-            {form.role === 'qa' && <MultiSelectField label="Allowed departments" options={DEPARTMENTS.map(d => ({ value: d, label: d }))} value={form.allowed_departments} onChange={v => setForm({ ...form, allowed_departments: v })} />}
+            {(form.role === 'qa' || form.role === 'supervisor' || form.role === 'cc_supervisor') && <MultiSelectField label={form.role === 'qa' ? 'Allowed departments' : 'Teams this supervisor may see (none = every team)'} options={DEPARTMENTS.map(d => ({ value: d, label: d }))} value={form.allowed_departments} onChange={v => setForm({ ...form, allowed_departments: v })} />}
             {(form.role === 'qa' || form.role === 'tl') && <MultiSelectField label="Allowed brands" options={brands} value={form.allowed_brands} onChange={v => setForm({ ...form, allowed_brands: v })} />}
             {error && <p className="text-sm font-bold text-rose-600">{error}</p>}
             <div className="flex gap-3 pt-2">

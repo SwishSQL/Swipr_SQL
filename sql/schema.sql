@@ -411,6 +411,22 @@ GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'qa_evaluations_client_key_uq' AND object_id = OBJECT_ID(N'dbo.qa_evaluations'))
 CREATE UNIQUE INDEX [qa_evaluations_client_key_uq] ON dbo.[qa_evaluations] ([client_key]) WHERE client_key IS NOT NULL;
 GO
+-- QA functions ("teams", Oct 2026): Customer Care (Swish) / Complaint Team (Complain) / Technical Team (TEC). An evaluation keeps the
+-- team of its agent at the time it was logged; existing rows take the agent's current department (former staff: qa_former_staff).
+IF COL_LENGTH(N'dbo.qa_evaluations', N'team') IS NULL ALTER TABLE dbo.[qa_evaluations] ADD [team] NVARCHAR(450) COLLATE Latin1_General_100_BIN2 NULL;
+GO
+UPDATE e SET team = CASE
+    WHEN LOWER(COALESCE(p.qa_department, f.department, N'')) LIKE N'tec%'   THEN N'TEC'
+    WHEN LOWER(COALESCE(p.qa_department, f.department, N'')) LIKE N'compl%' THEN N'Complain'
+    ELSE N'Swish' END
+  FROM dbo.[qa_evaluations] e
+  LEFT JOIN dbo.[qa_user_profile] p ON p.user_id = e.agent_id
+  LEFT JOIN dbo.[qa_former_staff] f ON f.id = e.agent_id
+  WHERE e.team IS NULL;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'qa_evaluations_team_idx' AND object_id = OBJECT_ID(N'dbo.qa_evaluations'))
+CREATE INDEX [qa_evaluations_team_idx] ON dbo.[qa_evaluations] ([team]);
+GO
 IF OBJECT_ID(N'dbo.qa_form_config', N'U') IS NULL
 CREATE TABLE dbo.[qa_form_config] (
   [id] INT IDENTITY(1,1) NOT NULL,
