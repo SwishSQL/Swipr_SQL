@@ -53,10 +53,11 @@ Connect -> Public/TCP URL). Put it in `.env`:
 PG_SOURCE_URL=postgresql://user:password@host:port/database
 ```
 
-Then, **before the first `npm start`**:
+Then stop the service (the app may already have been started once: with `AUTO_INIT_DB=true` it created the database and
+tables itself, which is the intended order) and run:
 
 ```bash
-npm run migrate:from-postgres
+npm run migrate:from-postgres -- --replace
 ```
 
 It creates the database and tables if they do not exist, reads the old database in ONE read-only snapshot (the source is
@@ -69,7 +70,7 @@ OK: 196920 rows, 1796968 cells verified identical.
 
 Anything else is an error that names the table and column. Afterwards remove `PG_SOURCE_URL` from `.env`.
 
-> Started the app already and it wrote some rows? Run `npm run migrate:from-postgres -- --replace` to wipe the tables first.
+> `--replace` empties the target tables first (the first start seeds a few rows), so the command can be repeated safely.
 >
 > **Order matters.** The Quality system used to be a separate application with its own database. Its data reaches this
 > database only after it has been imported into the PostgreSQL Swipr database (the Quality tables `qa_*` are then part of the
